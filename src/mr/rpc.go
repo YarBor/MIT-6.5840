@@ -19,7 +19,7 @@ import (
 type Args struct {
 	SelfName string 
 	Filename string
-	data string
+	Data string
 	Nreduce int `json:"Nreduce"`
 }
 type Reply struct {
@@ -28,6 +28,17 @@ type Reply struct {
 	Need_wait bool `json:"NeedWait"`
 	Nreduce int `json:"Nreduce"`
 	Filenames []string `json:"Filenames"`
+}
+func (r *Args) Clear()  {
+	r.Filename = ""
+	r.Data = ""
+	r.Nreduce = 0
+}
+func (r *Reply) Clear()  {
+	r.TaskName = ""
+	r.Need_wait = false
+	r.Nreduce = 0
+	r.Filenames = nil
 }
 
 type ExampleArgs struct {

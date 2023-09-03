@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -43,10 +44,14 @@ func (c *Coordinator) GetMapTask(a *Args, r *Reply) error {
 	select {
 	case filename, ok := <-c.Taskpipe:
 		if !ok { // close
-			r.Need_wait = false
+			if atomic.LoadInt32(&c.doneTaskNum) == int32(len(c.Tasks)) {
+				r.Need_wait = false
+			} else {
+				r.Need_wait = true
+			}
 		} else {
-
 			r.TaskName = string(filename)
+			r.Nreduce = int(c.reduce_size)
 			// atomic.StoreInt32(&c.Tasks[filename].mode, 1)
 			// atomic.StorePointer(&unsafe.Pointer(c.Tasks[filename].WorkerName),unsafe.Pointer(&a.SelfName))
 			// c.Tasks[filename].WorkerName.Store(unsafe.Pointer(&a.SelfName))
@@ -85,10 +90,10 @@ func (c *Coordinator) DoMapTaskErr(a *Args, r *Reply) error {
 	c.Tasks[filename(a.Filename)].lock.Lock()
 	defer c.Tasks[filename(a.Filename)].lock.Unlock()
 	if !(c.Tasks[filename(a.Filename)].mode == 1 && c.Tasks[filename(a.Filename)].WorkerName == a.SelfName) {
-		log.Println(a.data)
+		log.Println(a.Data)
 		return nil
 	}
-	log.Println(a.data)
+	log.Println(a.Data)
 
 	c.Tasks[filename(a.Filename)].C <- struct{}{}
 	c.Tasks[filename(a.Filename)].mode = 0
@@ -108,8 +113,10 @@ func (c *Coordinator) MapTaskDone(a *Args, r *Reply) error {
 	default:
 		log.Println("c.Tasks[filename(a.Filename)].C <- struct{}{} FAILED  in mapTaskDone")
 	}
+	fmt.Printf("Close %s channel %s done\n", filename(a.Filename), filename(a.SelfName))
 	close(c.Tasks[filename(a.Filename)].C)
 	if atomic.AddInt32(&c.doneTaskNum, 1) == int32(len(c.Tasks)) {
+		fmt.Printf("Close %s channel %s done\n", "MapTask", "MapTask")
 		close(c.Taskpipe)
 	}
 	return nil
@@ -118,7 +125,11 @@ func (c *Coordinator) ReduceTaskGet(a *Args, r *Reply) error {
 	select {
 	case TaskNum, ok := <-c.Nreduce:
 		if !ok { // close
-			r.Need_wait = false
+			if atomic.LoadInt32(&c.DoneReduceNum) == c.reduce_size {
+				r.Need_wait = false
+			} else {
+				r.Need_wait = true
+			}
 			r.Nreduce = -1
 		} else {
 			r.Nreduce = TaskNum
@@ -162,10 +173,10 @@ func (c *Coordinator) DoReduceTaskErr(a *Args, r *Reply) error {
 	c.ReduceTasks[a.Nreduce].lock.Lock()
 	defer c.ReduceTasks[a.Nreduce].lock.Unlock()
 	if !(c.ReduceTasks[a.Nreduce].WorkerName == a.SelfName && c.ReduceTasks[a.Nreduce].mode == 1) {
-		log.Println(a.data)
+		log.Println(a.Data)
 		return nil
 	}
-	log.Println(a.data)
+	log.Println(a.Data)
 
 	c.ReduceTasks[a.Nreduce].C <- struct{}{}
 	c.ReduceTasks[a.Nreduce].mode = 0
@@ -182,6 +193,8 @@ func (c *Coordinator) ReduceTasksDone(a *Args, r *Reply) error {
 	c.ReduceTasks[a.Nreduce].mode = 2
 	c.ReduceTasks[a.Nreduce].C <- struct{}{}
 	if atomic.AddInt32(&c.DoneReduceNum, 1) == c.reduce_size {
+
+		fmt.Printf("Close Redece:%d channel [Redece:%d] done\n", a.Nreduce, a.Nreduce)
 		close(c.Nreduce)
 	}
 	return nil
@@ -241,7 +254,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			C          chan struct{}
 			WorkerName string
 			lock       sync.Locker
-		}{mode: 0, C: make(chan struct{}, 1)}
+		}{mode: 0, C: make(chan struct{}, 1), lock: &sync.Mutex{}}
 		c.Taskpipe <- filename(f)
 	}
 	c.Nreduce = make(chan int, nReduce)
@@ -259,7 +272,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			C          chan struct{}
 			WorkerName string
 			lock       sync.Locker
-		}{mode: 0, C: make(chan struct{}, 1)}
+		}{mode: 0, C: make(chan struct{}, 1), lock: &sync.Mutex{}}
 	}
 	c.reduce_size = int32(nReduce)
 	c.server()
