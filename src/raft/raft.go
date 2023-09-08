@@ -149,7 +149,8 @@ func (r *Raft) registeHeartBeat(index int) {
 				if r.GetLevel() != LevelLeader {
 					goto restart
 				}
-				ok := r.RaftPeers[index].C.Call("Raft.HeartBeat", &arg, &rpl)
+				// ok := r.RaftPeers[index].C.Call("Raft.HeartBeat", &arg, &rpl)
+				ok := r.Call(index, "Raft.HeartBeat", &arg, &rpl)
 				// ok := r.peers[index].Call("Raft.HeartBeat", &arg, &rpl)
 				r.Dolog(index, "Raft.HeartBeat", ok, arg.String(), rpl.String())
 				if ok && !rpl.IsAgree {
