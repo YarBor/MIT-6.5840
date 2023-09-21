@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -29,7 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -207,6 +208,9 @@ func (r *Raft) getCommitIndex() int32 {
 func (r *Raft) getCommitIndexUnsafe() int32 {
 	return r.commitIndex
 }
+func (r *Raft) tryUpdateCommitIndex(i int32) {
+	r.commitChan <- i
+}
 func (r *Raft) setCommitIndex(i int32) {
 	r.commitIndexMutex.Lock()
 	defer r.commitIndexMutex.Unlock()
@@ -214,10 +218,13 @@ func (r *Raft) setCommitIndex(i int32) {
 }
 func (r *Raft) setCommitIndexUnsafe(i int32) {
 	r.commitIndex = i
-	r.dolog(-1, "setCommitIndex", i, "submit in commitChan")
-	r.commitChan <- i
-
 }
+
+// func (r *Raft) tryUpdateCommitIndexUnsafe(i int32) {
+// r.commitIndex = i
+// r.dolog(-1, "tryUpdateCommitIndex", i, "submit in commitChan")
+// r.commitChan <- i
+// }
 
 func (r *Raft) getLogIndex() int32 {
 	r.commandLog.MsgMu.Lock()
@@ -393,7 +400,7 @@ func (r *Raft) HeartBeat(arg *RequestArgs, rpl *RequestReply) {
 	}
 	if arg.LastLogTerm > rpl.PeerLastLogTerm {
 	} else if arg.CommitIndex > r.getCommitIndex() {
-		r.setCommitIndex(arg.CommitIndex)
+		r.tryUpdateCommitIndex(arg.CommitIndex)
 	}
 }
 
@@ -408,15 +415,26 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+
+func (rf *Raft) persist(Snapshot []byte) {
+	rf.commandLog.MsgMu.Lock()
+	defer rf.commandLog.MsgMu.Unlock()
+
+	buffer := bytes.Buffer{}
+	encoder := labgob.NewEncoder(&buffer)
+	err := encoder.Encode(atomic.LoadInt32(&rf.commitIndex))
+	if err != nil {
+		log.Fatal("Failed to encode CommitIndex: ", err)
+	}
+	err = encoder.Encode(atomic.LoadInt32(&rf.term))
+	if err != nil {
+		log.Fatal("Failed to encode Term: ", err)
+	}
+	err = encoder.Encode(rf.commandLog.Msgs[0:len(rf.commandLog.Msgs)])
+	if err != nil {
+		log.Fatal("Failed to encode Msgs: ", err)
+	}
+	rf.persister.Save(buffer.Bytes(), Snapshot)
 }
 
 // restore previously persisted state.
@@ -424,10 +442,33 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
+	rf.commandLog.MsgMu.Lock()
+	defer rf.commandLog.MsgMu.Unlock()
+	rf.commitIndexMutex.Lock()
+	defer rf.commitIndexMutex.Unlock()
+	rf.termLock.Lock()
+	defer rf.termLock.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int32
+	var Index int32
+	var Msgs []*ApplyMsg
+	if err := d.Decode(&Index); err != nil {
+		log.Fatal("Failed to decode Index: ", err)
+	}
+	if err := d.Decode(&term); err != nil {
+		log.Fatal("Failed to decode Term: ", err)
+	}
+	if err := d.Decode(&Msgs); err != nil {
+		log.Fatal("Failed to decode Msgs: ", err)
+	}
+	rf.term = term
+	rf.commitIndex = Index
+	rf.commandLog.Msgs = Msgs
+
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
 	// var xxx
 	// var yyy
 	// if d.Decode(&xxx) != nil ||
@@ -603,7 +644,6 @@ func (rf *Raft) appendMsg(msg *LogData) {
 	if msg == nil || rf.getLevel() == LevelLeader {
 		return
 	}
-
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, msg.Msg)
 	rf.raftPeers[rf.me].logIndex = int32(msg.Msg.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(msg.Msg.CommandTerm)
@@ -765,26 +805,27 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 	// 当对端发来的结构是 msg[0] == nil 时说明没有数据了
 	rf.commandLog.MsgMu.Lock()
 	defer rf.commandLog.MsgMu.Unlock()
-
-	for i := len(msg) - 1; i >= 0; i-- {
-		result := rf.checkMsg(msg[i])
-		switch result {
-		case LogCheckBeginOrReset:
-			rf.dolog(-1, "LogCheckBeginOrReset", msg[i].string())
-			rf.logBeginOrResetMsg(msg[i])
-		case LogCheckAppend:
-			rf.dolog(-1, "LogCheckAppend", msg[i].string())
-			rf.appendMsg(msg[i])
-		case LogCheckIgnore:
-			rf.dolog(-1, "LogCheckIgnore", msg[i].string())
-		case LogCheckStore:
-			rf.dolog(-1, "LogCheckStore", msg[i].string())
-			rf.storeMsg(msg[i])
-		default:
-			rf.pMsgStore.mu.Lock()
-			defer rf.pMsgStore.mu.Unlock()
-			rf.dolog(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
-			os.Exit(1)
+	if msg[0].Msg.CommandValid {
+		for i := len(msg) - 1; i >= 0; i-- {
+			result := rf.checkMsg(msg[i])
+			switch result {
+			case LogCheckBeginOrReset:
+				rf.dolog(-1, "LogCheckBeginOrReset", msg[i].string())
+				rf.logBeginOrResetMsg(msg[i])
+			case LogCheckAppend:
+				rf.dolog(-1, "LogCheckAppend", msg[i].string())
+				rf.appendMsg(msg[i])
+			case LogCheckIgnore:
+				rf.dolog(-1, "LogCheckIgnore", msg[i].string())
+			case LogCheckStore:
+				rf.dolog(-1, "LogCheckStore", msg[i].string())
+				rf.storeMsg(msg[i])
+			default:
+				rf.pMsgStore.mu.Lock()
+				defer rf.pMsgStore.mu.Unlock()
+				rf.dolog(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
+				os.Exit(1)
+			}
 		}
 	}
 	i := rf.saveMsg()
@@ -798,7 +839,6 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 		}
 
 	}
-
 	return i
 }
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -1224,7 +1264,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 				}
 				if ToLogHalfIndex.index > ToLogIndex {
 					ToLogIndex = ToLogHalfIndex.index
-					atomic.StoreInt32(&rf.commitIndex, ToLogIndex)
+					// atomic.StoreInt32(&rf.commitIndex, ToLogIndex)
 					rf.dolog(-1, "Committer: Update CommitIndex", ToLogIndex)
 				}
 			}
@@ -1257,9 +1297,12 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 						if expectedLogMsgCacheIndex <= 0 || expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
 							return false, expectedLogMsgCacheIndex
 						} else {
+							// commit operation
 							applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]
+
 							rf.dolog(-1, fmt.Sprintf("Committer: Commit log message CacheIndex:[%d] Index[%d] %s", expectedLogMsgCacheIndex, exceptLogMsgIndex, rf.commandLog.Msgs[expectedLogMsgCacheIndex].string()))
 							LogedIndex = exceptLogMsgIndex
+							rf.setCommitIndex(LogedIndex)
 							time.Sleep(10 * time.Millisecond)
 						}
 						return true, -1
