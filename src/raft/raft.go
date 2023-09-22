@@ -211,13 +211,20 @@ func (r *Raft) getCommitIndexUnsafe() int32 {
 func (r *Raft) tryUpdateCommitIndex(i int32) {
 	r.commitChan <- i
 }
+
+// because of persistent The caller needs exclusive rf.commands.msgs (lock)
 func (r *Raft) setCommitIndex(i int32) {
 	r.commitIndexMutex.Lock()
 	defer r.commitIndexMutex.Unlock()
 	r.setCommitIndexUnsafe(i)
 }
+
 func (r *Raft) setCommitIndexUnsafe(i int32) {
 	r.commitIndex = i
+	r.persistUnsafe(r.getSnapshot())
+}
+func (r *Raft) getSnapshot() []byte {
+	return nil
 }
 
 // func (r *Raft) tryUpdateCommitIndexUnsafe(i int32) {
@@ -248,6 +255,7 @@ func (r *Raft) setTerm(i int32) {
 	r.termLock.Lock()
 	defer r.termLock.Unlock()
 	r.term = i
+	r.persist(r.getSnapshot())
 }
 func (r *Raft) beginSendHeartBeat() {
 	for i := range r.raftPeers {
@@ -317,6 +325,13 @@ func (r *Raft) changeToLeader() {
 	select {
 	case r.levelChangeChan <- struct{}{}:
 	default:
+	}
+	for i := range r.raftPeers {
+		if i == r.me {
+			r.raftPeers[r.me].logIndex, r.raftPeers[r.me].lastLogTerm = r.getLastLogData()
+		} else {
+			r.raftPeers[i].lastLogTerm, r.raftPeers[i].logIndex = 0, 0
+		}
 	}
 	r.beginSendHeartBeat()
 }
@@ -415,11 +430,14 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-
 func (rf *Raft) persist(Snapshot []byte) {
 	rf.commandLog.MsgMu.Lock()
 	defer rf.commandLog.MsgMu.Unlock()
+	rf.persistUnsafe(Snapshot)
+}
 
+// 此函数不保证对log的操作的原子性
+func (rf *Raft) persistUnsafe(Snapshot []byte) {
 	buffer := bytes.Buffer{}
 	encoder := labgob.NewEncoder(&buffer)
 	err := encoder.Encode(atomic.LoadInt32(&rf.commitIndex))
@@ -648,6 +666,7 @@ func (rf *Raft) appendMsg(msg *LogData) {
 	rf.raftPeers[rf.me].logIndex = int32(msg.Msg.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(msg.Msg.CommandTerm)
 	rf.dolog(-1, "LogAppend", msg.Msg.string())
+	rf.persistUnsafe(rf.getSnapshot())
 }
 func (rf *Raft) getLastLogData() (int32, int32) {
 	rf.commandLog.MsgMu.Lock()
@@ -726,7 +745,7 @@ func (rf *Raft) saveMsg() *LogData {
 
 	// store的 更新到头了
 	if rf.pMsgStore.msgs == nil || len(rf.pMsgStore.msgs) == 0 {
-		panic("rf.pMsgStore.msgs is not initialized")
+		panic("rf.pMsgStore.msgs is not initialized , May race state result")
 	} else if rf.pMsgStore.msgs[0].LastTimeTerm == -1 {
 		rf.commandLog.Msgs = rf.commandLog.Msgs[:1]
 		rf.pMsgStore.msgs = rf.pMsgStore.msgs[1:]
@@ -734,6 +753,7 @@ func (rf *Raft) saveMsg() *LogData {
 			rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[i].Msg)
 		}
 		rf.pMsgStore.msgs = make([]*LogData, 0)
+		rf.persistUnsafe(rf.getSnapshot())
 		return nil
 	}
 
@@ -756,6 +776,7 @@ func (rf *Raft) saveMsg() *LogData {
 						rf.commandLog.Msgs = rf.commandLog.Msgs[:index+2]
 					}
 				}
+				rf.persistUnsafe(rf.getSnapshot())
 			} else {
 				break
 			}
@@ -795,6 +816,7 @@ func (rf *Raft) logBeginOrResetMsg(log *LogData) {
 	}
 
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, log.Msg)
+	rf.persistUnsafe(rf.getSnapshot())
 	rf.raftPeers[rf.me].logIndex = int32(log.Msg.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(log.Msg.CommandTerm)
 	rf.dolog(-1, "Log", log.Msg.string())
