@@ -32,23 +32,27 @@ import (
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	// "golang.org/x/tools/go/analysis/passes/nilfunc"
 )
 
-var (
+const (
 	LevelLeader    = int32(3)
 	LevelCandidate = int32(2)
 	LevelFollower  = int32(1)
 
 	commitChanSize   = int32(100)
-	rpcTimeOut       = 100 * time.Millisecond
-	HeartbeatTimeout = 50 * time.Millisecond
-	voteTimeOut      = 100
+	rpcTimeOut       = 200 * time.Millisecond
+	HeartbeatTimeout = 75 * time.Millisecond
+	voteTimeOut      = 200
 
 	LogCheckBeginOrReset = 0
 	LogCheckAppend       = 1
 	LogCheckStore        = 2
 	LogCheckIgnore       = 3
 	LogCheckReLoad       = 4
+	LogCheckSnap         = 5
+
+	UpdateLogLines = 500
 
 	LogStateNormal = int32(0)
 	LogUpdateIng   = int32(1)
@@ -125,6 +129,7 @@ type LogData struct {
 	LastTimeIndex int
 	LastTimeTerm  int
 	SelfIndex     int
+	SelfTermNow   int
 }
 
 func (a *ApplyMsg) string() string {
@@ -136,8 +141,8 @@ func (a *LogData) string() string {
 
 // a piece of Raft
 type Log struct {
-	Msgs  []*ApplyMsg
-	MsgMu sync.Mutex
+	Msgs    []*ApplyMsg
+	MsgRwMu sync.RWMutex
 }
 
 // A Go object implementing a single Raft peer.
@@ -147,9 +152,10 @@ type RaftPeer struct {
 	BeginHeartBeat chan struct{}
 	StopHeartBeat  chan struct{}
 	JumpHeartBeat  chan struct{}
-	// logIndexLock   sync.Mutex
-	logIndex    int32
-	lastLogTerm int32
+
+	logIndexTermLock sync.Mutex
+	logIndex         int32
+	lastLogTerm      int32
 }
 
 // tmp stuct to update Log data
@@ -186,7 +192,7 @@ type Raft struct {
 	commitIndexMutex sync.Mutex //
 
 	term            int32 //
-	termLock        sync.Locker
+	termLock        sync.Mutex
 	timeOutChan     chan struct{}
 	levelChangeChan chan struct{}
 	raftPeers       []RaftPeer
@@ -209,13 +215,19 @@ func (r *Raft) getCommitIndex() int32 {
 	return r.getCommitIndexUnsafe()
 }
 func (r *Raft) getCommitIndexUnsafe() int32 {
-	return r.commitIndex
+	return atomic.LoadInt32(&r.commitIndex)
 }
 func (r *Raft) tryUpdateCommitIndex(i int32) {
 	r.commitChan <- i
 }
 
 // because of persistent The caller needs exclusive rf.commands.msgs (lock)
+func (r *Raft) justSetCommitIndex(i int32) {
+	r.commitIndexMutex.Lock()
+	defer r.commitIndexMutex.Unlock()
+	r.commitIndex = i
+}
+
 func (r *Raft) setCommitIndex(i int32) {
 	r.commitIndexMutex.Lock()
 	defer r.commitIndexMutex.Unlock()
@@ -226,8 +238,18 @@ func (r *Raft) setCommitIndexUnsafe(i int32) {
 	r.commitIndex = i
 	r.persistUnsafe(r.getSnapshot())
 }
-func (r *Raft) getSnapshot() []byte {
-	return nil
+func (r *Raft) getSnapshot() *ApplyMsg {
+	r.commandLog.MsgRwMu.RLock()
+	defer r.commandLog.MsgRwMu.RUnlock()
+	return r.getSnapshotUnsafe()
+}
+// unsafe 
+func (r *Raft) getSnapshotUnsafe() *ApplyMsg {
+	if r.commandLog.Msgs[0] == nil || r.commandLog.Msgs[0].Snapshot == nil {
+		return nil
+	}
+	r.dolog(-1, fmt.Sprintf("Get SnapShot index[%d] , term[%d]", r.commandLog.Msgs[0].SnapshotIndex, r.commandLog.Msgs[0].SnapshotTerm))
+	return r.commandLog.Msgs[0]
 }
 
 // func (r *Raft) tryUpdateCommitIndexUnsafe(i int32) {
@@ -237,8 +259,8 @@ func (r *Raft) getSnapshot() []byte {
 // }
 
 func (r *Raft) getLogIndex() int32 {
-	r.commandLog.MsgMu.Lock()
-	defer r.commandLog.MsgMu.Unlock()
+	r.commandLog.MsgRwMu.RLock()
+	defer r.commandLog.MsgRwMu.RUnlock()
 	return r.getLogIndexUnsafe()
 }
 func (r *Raft) getLogIndexUnsafe() int32 {
@@ -257,6 +279,9 @@ func (r *Raft) getTerm() int32 {
 func (r *Raft) setTerm(i int32) {
 	r.termLock.Lock()
 	defer r.termLock.Unlock()
+	r.setTermUnsafe(i)
+}
+func (r *Raft) setTermUnsafe(i int32) {
 	r.term = i
 	r.persist(r.getSnapshot())
 }
@@ -313,18 +338,26 @@ func (r *Raft) registeHeartBeat(index int) {
 					continue
 				}
 				if ok && !rpl.IsAgree && (rpl.PeerSelfTerm > r.getTerm() || rpl.PeerLastLogIndex > r.getLogIndex() || rpl.PeerLastLogTerm > arg.LastLogTerm) {
-					r.commandLog.MsgMu.Lock()
-					func(o ...*ApplyMsg) {
-						for _, a := range o {
-							r.dolog(-1, a.string())
-						}
-					}(r.commandLog.Msgs...)
-					r.commandLog.MsgMu.Unlock()
+
+					r.commandLog.MsgRwMu.RLock()
+					r.debugLoger.Println("\nHeartBeat Error:\n " + showMsgS(r.commandLog.Msgs))
+					r.commandLog.MsgRwMu.RUnlock()
+
 					r.dolog(index, "r.HeartBeatErrr", r.getLogIndex(), "heartbeat return false Going to be Follower", arg.string(), rpl.string())
 					r.changeToFollower(&rpl)
 				} else {
-					atomic.StoreInt32(&r.raftPeers[index].logIndex, rpl.PeerLastLogIndex)
-					atomic.StoreInt32(&r.raftPeers[index].lastLogTerm, rpl.PeerLastLogTerm)
+					// atomic.StoreInt32(&r.raftPeers[index].logIndex, rpl.PeerLastLogIndex)
+					// atomic.StoreInt32(&r.raftPeers[index].lastLogTerm, rpl.PeerLastLogTerm)
+					func() {
+						r.raftPeers[index].logIndexTermLock.Lock()
+						defer r.raftPeers[index].logIndexTermLock.Unlock()
+						if rpl.PeerLastLogTerm > r.raftPeers[index].lastLogTerm {
+							r.raftPeers[index].lastLogTerm = rpl.PeerLastLogTerm
+							r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
+						} else if rpl.PeerLastLogTerm == r.raftPeers[index].lastLogTerm {
+							r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
+						}
+					}()
 					if rpl.PeerLastLogIndex < arg.LastLogIndex || rpl.PeerLastLogTerm < arg.LastLogTerm {
 						r.tryleaderUpdatePeer(index, &LogData{Msg: nil, LastTimeIndex: int(arg.LastLogIndex), LastTimeTerm: int(arg.LastLogTerm)})
 					}
@@ -343,9 +376,13 @@ func (r *Raft) changeToLeader() {
 	}
 	for i := range r.raftPeers {
 		if i == r.me {
+			r.raftPeers[i].logIndexTermLock.Lock()
 			r.raftPeers[r.me].logIndex, r.raftPeers[r.me].lastLogTerm = r.getLastLogData()
+			r.raftPeers[i].logIndexTermLock.Unlock()
 		} else {
+			r.raftPeers[i].logIndexTermLock.Lock()
 			r.raftPeers[i].lastLogTerm, r.raftPeers[i].logIndex = 0, 0
+			r.raftPeers[i].logIndexTermLock.Unlock()
 		}
 	}
 	r.beginSendHeartBeat()
@@ -360,7 +397,7 @@ func (r *Raft) changeToCandidate() {
 }
 func (r *Raft) changeToFollower(rpl *RequestReply) {
 	r.dolog(-1, "Going to Be Follower")
-	if atomic.LoadInt32(&r.level) == LevelLeader {
+	if r.getLevel() == LevelLeader {
 		r.stopSendHeartBeat()
 	}
 	if rpl != nil {
@@ -385,7 +422,6 @@ func (r *Raft) changeToFollower(rpl *RequestReply) {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 func (r *Raft) HeartBeat(arg *RequestArgs, rpl *RequestReply) {
-	r.timeOutChan <- struct{}{}
 
 	defer func(tmpArg *RequestArgs, tmpRpl *RequestReply) {
 		r.dolog(int(tmpArg.SelfIndex), "REPLY Heartbeat", "\t\n Arg:", tmpArg.string(), "\t\n Rpl:", tmpRpl.string())
@@ -395,31 +431,23 @@ func (r *Raft) HeartBeat(arg *RequestArgs, rpl *RequestReply) {
 	rpl.PeerSelfTerm = r.getTerm()
 	rpl.ReturnTime = time.Now()
 
-	switch {
-	case arg.SelfTerm < rpl.PeerSelfTerm:
-		rpl.IsAgree = false
+	rpl.IsAgree = arg.LastLogTerm >= rpl.PeerLastLogTerm && (arg.LastLogTerm > rpl.PeerLastLogTerm || arg.LastLogIndex >= rpl.PeerLastLogIndex)
+	if !rpl.IsAgree {
 		return
-	case arg.LastLogTerm < rpl.PeerLastLogTerm:
-		rpl.IsAgree = false
-		return
-	case arg.LastLogIndex < rpl.PeerLastLogIndex:
-		if arg.LastLogTerm > rpl.PeerLastLogTerm {
-			// 更新中 新的leader的log版本(最后一项Term)比自己新
-			rpl.IsAgree = true
-		} else {
-			rpl.IsAgree = false
-			return
-		}
-	default:
-		rpl.IsAgree = true
 	}
+	if arg.SelfTerm > rpl.PeerSelfTerm {
+		rpl.PeerSelfTerm = arg.SelfIndex
+		r.setTerm(arg.SelfTerm)
+	}
+	select {
+	case r.timeOutChan <- struct{}{}:
+	default:
+	}
+
 	if r.getLevel() == LevelLeader {
 		rpll := *rpl
 		rpll.PeerSelfTerm = arg.SelfTerm
 		r.changeToFollower(&rpll)
-	}
-	if arg.SelfTerm > rpl.PeerSelfTerm {
-		r.setTerm(arg.SelfTerm)
 	}
 	if arg.Msg == nil || len(arg.Msg) == 0 {
 	} else {
@@ -447,14 +475,22 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist(Snapshot []byte) {
-	rf.commandLog.MsgMu.Lock()
-	defer rf.commandLog.MsgMu.Unlock()
-	rf.persistUnsafe(Snapshot)
+func (rf *Raft) persist(snapshot *ApplyMsg) {
+
+	rf.commandLog.MsgRwMu.Lock()
+	defer rf.commandLog.MsgRwMu.Unlock()
+	rf.persistUnsafe(snapshot)
+
 }
 
 // 此函数不保证对log的操作的原子性
-func (rf *Raft) persistUnsafe(Snapshot []byte) {
+func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
+	if snapshot != nil {
+		if snapshot.SnapshotIndex < rf.commandLog.Msgs[0].SnapshotIndex {
+			return
+		}
+	}
+
 	buffer := bytes.Buffer{}
 	encoder := labgob.NewEncoder(&buffer)
 	err := encoder.Encode(atomic.LoadInt32(&rf.commitIndex))
@@ -465,14 +501,20 @@ func (rf *Raft) persistUnsafe(Snapshot []byte) {
 	if err != nil {
 		log.Fatal("Failed to encode Term: ", err)
 	}
-	err = encoder.Encode(rf.commandLog.Msgs[0:len(rf.commandLog.Msgs)])
+	i := rf.commandLog.Msgs[0].Snapshot
+	rf.commandLog.Msgs[0].Snapshot = nil
+	err = encoder.Encode(rf.commandLog.Msgs)
 	if err != nil {
 		log.Fatal("Failed to encode Msgs: ", err)
 	}
-
+	rf.commandLog.Msgs[0].Snapshot = i
 	encodedData := buffer.Bytes() // 获取编码后的数据
 
-	rf.persister.Save(encodedData, Snapshot) // 保存数据到持久化存储
+	if snapshot != nil && snapshot.Snapshot != nil {
+		rf.persister.Save(encodedData, snapshot.Snapshot) // 保存数据到持久化存储
+	} else {
+		rf.persister.Save(encodedData, nil) // 保存数据到持久化存储
+	}
 
 	// 记录输出
 	output := fmt.Sprintf("Encoded CommitIndex: %v, Term: %v, \n(Len:%d)Msgs: %s",
@@ -483,6 +525,7 @@ func (rf *Raft) persistUnsafe(Snapshot []byte) {
 	rf.debugLoger.Println("\nPersist Save - " + output)
 }
 
+// Unsafe 	
 func showMsgS(rf []*ApplyMsg) string {
 	str := "\n"
 	for i := range rf {
@@ -496,13 +539,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-
-	rf.commandLog.MsgMu.Lock()
-	defer rf.commandLog.MsgMu.Unlock()
-	rf.commitIndexMutex.Lock()
-	defer rf.commitIndexMutex.Unlock()
-	rf.termLock.Lock()
-	defer rf.termLock.Unlock()
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -531,6 +567,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.term,
 		rf.commandLog.Msgs)
 	rf.dolog(-1, "Persist Load - "+output)
+	rf.commandLog.Msgs[0].Snapshot = rf.persister.ReadSnapshot()
 	// Your code here (2C).
 	// Example:
 	// var xxx
@@ -544,13 +581,61 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+// unsafe
+func (rf *Raft) GetTargetCacheIndex(index int) int {
+	if len(rf.commandLog.Msgs) == 0 {
+		// return -1
+		panic("len(rf.commandLog.Msgs) == 0")
+	}
+	LastLog := rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1]
+	IndexReturn := 0
+	if LastLog.SnapshotValid {
+		IndexReturn = len(rf.commandLog.Msgs) - (LastLog.SnapshotIndex - index) - 1
+	} else {
+		IndexReturn = len(rf.commandLog.Msgs) - (LastLog.CommandIndex - index) - 1
+	}
+	if !(IndexReturn > 0 && IndexReturn < len(rf.commandLog.Msgs)) {
+		rf.dolog(-1, fmt.Sprintf("Try to get index %d return %d rf.Msgs(len(%d) , lastIndex(%d))", index, IndexReturn, len(rf.commandLog.Msgs), (rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex)))
+	}
+	return IndexReturn
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.commandLog.MsgRwMu.Lock()
+	defer rf.commandLog.MsgRwMu.Unlock()
+	rf.SnapshotUnsafe(index, snapshot)
+}
 
+func (rf *Raft) SnapshotUnsafe(index int, snapshot []byte) {
+	// Your code here (2D).
+	rf.dolog(-1, "snapshot Index:%v", index)
+	if index < rf.commandLog.Msgs[0].SnapshotIndex {
+		return
+	}
+	if rf.GetTargetCacheIndex(index) <= 0 || rf.GetTargetCacheIndex(index) > len(rf.commandLog.Msgs) {
+		panic("Snapshot Called, But Not found correspond Log")
+	}
+	cacheIndex := rf.GetTargetCacheIndex(index)
+	if cacheIndex < 0 {
+		panic("SnapShot Index Out of Range")
+	}
+	newMagsHead := ApplyMsg{CommandValid: true, Command: nil, CommandIndex: 0, CommandTerm: -1, SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: rf.commandLog.Msgs[rf.GetTargetCacheIndex(index)].CommandTerm, SnapshotIndex: index}
+	if cacheIndex >= len(rf.commandLog.Msgs) {
+		rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), &newMagsHead)
+	} else {
+		oldMsgs := rf.commandLog.Msgs
+		if len(oldMsgs) > 1 {
+			rf.commandLog.Msgs = append(append(make([]*ApplyMsg, 0), &newMagsHead), oldMsgs[1:cacheIndex+1]...)
+		} else {
+			rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), &newMagsHead)
+		}
+	}
+	rf.persistUnsafe(rf.commandLog.Msgs[0])
 }
 
 func (r *RequestArgs) string() string {
@@ -561,7 +646,7 @@ func (r *RequestArgs) string() string {
 		for i := 0; i < len(r.Msg); i++ {
 			str += fmt.Sprintf("Msg:(%s)", r.Msg[i].string())
 		}
-		str += fmt.Sprintf("%+v", *r)
+		str += fmt.Sprintf("\n\t%+v", *r)
 		return str
 	}
 }
@@ -577,25 +662,46 @@ func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
 	reply.PeerLastLogIndex, reply.PeerLastLogTerm = r.getLastLogData()
 	reply.PeerSelfTerm = r.getTerm()
 	reply.ReturnTime = time.Now()
-	reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && ((reply.PeerLastLogTerm < args.LastLogTerm) || (reply.PeerLastLogIndex <= args.LastLogIndex && reply.PeerLastLogTerm == args.LastLogTerm))
+	// reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && ((reply.PeerLastLogTerm < args.LastLogTerm) || (reply.PeerLastLogIndex <= args.LastLogIndex && reply.PeerLastLogTerm == args.LastLogTerm))
+	reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && args.LastLogTerm >= reply.PeerLastLogTerm && (args.LastLogTerm > reply.PeerLastLogTerm || args.LastLogIndex >= reply.PeerLastLogIndex) && reply.PeerSelfTerm < args.SelfTerm
 }
 
 func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.termLock.Lock()
 	defer rf.termLock.Unlock()
 	reply.PeerSelfTerm = rf.term
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	thisLastLogindex, thisLastLogTerm := rf.getLastLogData()
-	if rf.term < args.SelfTerm && (args.LastLogTerm > thisLastLogTerm || (args.LastLogIndex >= thisLastLogindex && args.LastLogTerm >= thisLastLogTerm)) {
-		reply.IsAgree = true
-		rf.term = args.SelfTerm
-		atomic.StoreInt32(&rf.isLeaderAlive, 1)
-	} else {
+	reply.PeerLastLogIndex, reply.PeerLastLogTerm = rf.getLastLogData()
+	//	选举投票与否的标准是 各个节点的日志的新旧程度 当新旧程度一样时 再比较投票的任期
+	reply.IsAgree = true
+	if args.LastLogTerm < reply.PeerLastLogTerm {
 		reply.IsAgree = false
+		rf.dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogTerm < reply.PeerLastLogTerm")
+	} else if args.LastLogTerm == reply.PeerLastLogTerm {
+		if args.LastLogIndex < reply.PeerLastLogIndex {
+			reply.IsAgree = false
+			rf.dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogIndex < reply.PeerLastLogIndex")
+		} else if args.LastLogIndex == reply.PeerLastLogIndex {
+			if args.SelfTerm <= reply.PeerSelfTerm {
+				reply.IsAgree = false
+				rf.dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.SelfTerm <= reply.PeerSelfTerm")
+			}
+		}
 	}
-	reply.PeerLastLogIndex = rf.getLogIndex()
+	if args.SelfTerm <= reply.PeerSelfTerm {
+		reply.IsAgree = false
+		rf.dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.SelfTerm <= reply.PeerSelfTerm")
+	}
+	if reply.IsAgree {
+		if rf.getLevel() == LevelLeader {
+			rf.changeToFollower(nil)
+		}
+		rf.setTermUnsafe(args.SelfTerm)
+		atomic.StoreInt32(&rf.isLeaderAlive, 1)
+	}
 	reply.ReturnTime = time.Now()
+	rf.dolog(int(args.SelfIndex), "answer RequestVote", args.string(), reply.string())
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -644,65 +750,75 @@ func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
 // term. the third return value is true if this server believes it is
 // the leader.
 
-func (rf *Raft) checkMsg(msg *LogData) int {
-	if msg == nil {
+func (rf *Raft) checkMsg(data *LogData) int {
+	if data == nil {
 		return -1
 	}
 	// check过程中进行拿锁
 
 	if len(rf.commandLog.Msgs) == 0 {
-		return LogCheckBeginOrReset
+		panic("len(rf.commandLog.Msgs) == 0")
 	}
 
 	rf.pMsgStore.mu.Lock()
 	defer rf.pMsgStore.mu.Unlock()
-	if rf.pMsgStore.term < int32(msg.Msg.CommandTerm) {
-		rf.pMsgStore = &MsgStore{msgs: make([]*LogData, 0), owner: msg.SelfIndex, mu: sync.Mutex{}, term: int32(msg.Msg.CommandTerm)}
+	if rf.pMsgStore.term < int32(data.SelfTermNow) {
+		rf.pMsgStore = &MsgStore{msgs: make([]*LogData, 0), owner: data.SelfIndex, mu: sync.Mutex{}, term: int32(data.SelfTermNow)}
+	}
+	if data.Msg.SnapshotValid {
+		return LogCheckSnap
 	}
 
+	// 将 snapindex 记录成 commandindex 去进行Check
 	lastRfLog := rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1]
-	getIndex := func(i int) int {
-		if len(rf.commandLog.Msgs) == 0 {
-			// return -1
-			panic("len(rf.commandLog.Msgs) == 0")
-		}
-		retu := len(rf.commandLog.Msgs) - (rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex - i) - 1
-		rf.dolog(-1, fmt.Sprintf("Try to get index %d return %d rf.Msgs(len(%d) , lastIndex(%d))", i, retu, len(rf.commandLog.Msgs), (rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex)))
-
-		return retu
+	if lastRfLog.SnapshotValid {
+		lastRfLog.CommandIndex, lastRfLog.CommandTerm = lastRfLog.SnapshotIndex, lastRfLog.SnapshotTerm
 	}
-	rf.dolog(-1, "Will check ", msg.string())
+	rf.dolog(-1, "Will check ", data.string())
+
 	switch {
 	// 如果已经提交过的 忽略
-	case msg.Msg.CommandIndex <= int(rf.getCommitIndex()):
+	case data.Msg.CommandIndex <= int(rf.getCommitIndexUnsafe()):
 		return LogCheckIgnore
 
-	// 第一项log
-	case msg.LastTimeIndex == 0 && msg.LastTimeTerm == -1:
-		if len(rf.commandLog.Msgs) == 1 || rf.commandLog.Msgs[1].CommandTerm != msg.Msg.CommandTerm {
+	// 没有快照之前的 第一项log
+	case data.LastTimeIndex == 0 && data.LastTimeTerm == -1:
+		if len(rf.commandLog.Msgs) == 1 || rf.commandLog.Msgs[1].CommandTerm != data.Msg.CommandTerm {
 			return LogCheckBeginOrReset
 		} else {
 			return LogCheckIgnore
 		}
 
-	case msg.LastTimeIndex == lastRfLog.CommandIndex:
-		if msg.LastTimeTerm == lastRfLog.CommandTerm {
+	case data.LastTimeIndex == lastRfLog.CommandIndex:
+		if data.LastTimeTerm == lastRfLog.CommandTerm {
 			// prelog和现有log最后一项 完全相同 append
 			return LogCheckAppend
 		} else {
+			if lastRfLog.SnapshotValid {
+				panic("\nsnapshot Dis-agreement \n" + lastRfLog.string())
+			}
 			// 否则 store
 			return LogCheckStore
 		}
 	// 传入数据 索引元高于本地
-	case msg.LastTimeIndex > lastRfLog.CommandIndex:
+	case data.LastTimeIndex > lastRfLog.CommandIndex:
 		// 进行(同步)缓存
 		return LogCheckStore
 
 	// store
-	case msg.LastTimeIndex < lastRfLog.CommandIndex:
-		if msg.LastTimeIndex <= 0 {
-			panic("requeste update command index is out of range [<0]")
-		} else if rf.commandLog.Msgs[getIndex(msg.Msg.CommandIndex)].CommandTerm == msg.Msg.CommandTerm && rf.commandLog.Msgs[getIndex(msg.LastTimeIndex)].CommandTerm == msg.LastTimeTerm {
+	case data.LastTimeIndex < lastRfLog.CommandIndex:
+		if data.LastTimeIndex <= 0 {
+			panic("requeste update command index is out of range [<=0]")
+		} else if i := rf.GetTargetCacheIndex(data.Msg.CommandIndex); i <= 0 {
+			if rf.getSnapshotUnsafe().SnapshotValid && rf.getSnapshotUnsafe().SnapshotIndex >= data.Msg.CommandIndex {
+				return LogCheckIgnore
+			} else {
+				panic("requeste update command index is out of range[<=0]\n" + data.string() + "\n" + rf.getSnapshotUnsafe().string())
+			}
+		} else if rf.commandLog.Msgs[rf.GetTargetCacheIndex(data.Msg.CommandIndex)].CommandTerm == data.Msg.CommandTerm && rf.commandLog.Msgs[rf.GetTargetCacheIndex(data.LastTimeIndex)].CommandTerm == data.LastTimeTerm {
+			// [S][C][C][C][C][C][][][][]
+			//    -------^-
+			//   (check)[C] --> same
 			return LogCheckIgnore
 		}
 		return LogCheckStore
@@ -715,14 +831,16 @@ func (rf *Raft) appendMsg(msg *LogData) {
 		return
 	}
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, msg.Msg)
+	rf.raftPeers[rf.me].logIndexTermLock.Lock()
+	defer rf.raftPeers[rf.me].logIndexTermLock.Unlock()
 	rf.raftPeers[rf.me].logIndex = int32(msg.Msg.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(msg.Msg.CommandTerm)
 	rf.dolog(-1, "LogAppend", msg.Msg.string())
-	rf.persistUnsafe(rf.getSnapshot())
 }
 func (rf *Raft) getLastLogData() (int32, int32) {
-	rf.commandLog.MsgMu.Lock()
-	defer rf.commandLog.MsgMu.Unlock()
+
+	rf.commandLog.MsgRwMu.RLock()
+	defer rf.commandLog.MsgRwMu.RUnlock()
 	return int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandTerm)
 }
 
@@ -750,20 +868,23 @@ func (m *MsgStore) insert(target *LogData) {
 		}
 	}
 	if m.msgs[index].Msg.CommandIndex == target.Msg.CommandIndex {
-		m.msgs[index] = target
+		if m.msgs[index].Msg.CommandTerm != target.Msg.CommandTerm {
+			m.msgs[index] = target
+		}
 	} else {
 		m.msgs = append(m.msgs, nil)
 		copy(m.msgs[index+1:], m.msgs[index:])
 		m.msgs[index] = target
 	}
-	log.Printf("m: %v\n", m)
+	// log.Printf("m: %v\n", m)
 }
 
 // expect a orderly list in this
 // when rf.msgs's tail  ==  this list 's head
 // do update And Del this list 's head step by step
 // to rf.msgs's tail != this list 's head || this list 's len == 0
-func (rf *Raft) saveMsg() *LogData {
+
+func (rf *Raft) saveMsg() (*LogData, bool) {
 
 	if func() *MsgStore {
 		rf.pMsgStoreCreateLock.Lock()
@@ -779,46 +900,44 @@ func (rf *Raft) saveMsg() *LogData {
 			return rf.pMsgStore
 		}
 	}() == nil {
-		return nil
+		return nil, false
 	}
+	IsChangeMsg := false
 
 	rf.pMsgStore.mu.Lock()
 	defer rf.pMsgStore.mu.Unlock()
-
-	getIndex := func(i int) int {
-		if len(rf.commandLog.Msgs) == 0 {
-			// return -1
-			panic("len(rf.commandLog.Msgs) == 0")
-		}
-		retu := len(rf.commandLog.Msgs) - rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex + i - 1
-		rf.dolog(-1, fmt.Sprintf("Try to get index %d return %d", i, retu))
-		return retu
-	}
-
 	// store的 更新到头了
 	if rf.pMsgStore.msgs == nil || len(rf.pMsgStore.msgs) == 0 {
 		panic("rf.pMsgStore.msgs is not initialized , May race state result")
+
+		// 有快照之前的追加
 	} else if rf.pMsgStore.msgs[0].LastTimeTerm == -1 {
 		rf.commandLog.Msgs = rf.commandLog.Msgs[:1]
+		rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[0].Msg)
 		rf.pMsgStore.msgs = rf.pMsgStore.msgs[1:]
-		for i := range rf.pMsgStore.msgs {
-			rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[i].Msg)
-			rf.persistUnsafe(rf.getSnapshot())
-		}
-		rf.pMsgStore.msgs = make([]*LogData, 0)
-		rf.persistUnsafe(rf.getSnapshot())
-		return nil
+		// rf.pMsgStore.msgs = make([]*LogData, 0)
+		// return nil, true
+		IsChangeMsg = true
 	}
 
 	for {
 		if len(rf.pMsgStore.msgs) == 0 {
 			break
 		}
-		index := getIndex(rf.pMsgStore.msgs[0].LastTimeIndex)
+		index := rf.GetTargetCacheIndex(rf.pMsgStore.msgs[0].LastTimeIndex)
 		if index >= len(rf.commandLog.Msgs) {
 			break
-		} else if index < 0 {
-			break
+		} else if index <= 0 {
+			if rf.getSnapshotUnsafe().SnapshotValid &&
+				rf.pMsgStore.msgs[0].LastTimeIndex == rf.getSnapshotUnsafe().SnapshotIndex &&
+				rf.pMsgStore.msgs[0].LastTimeTerm == rf.getSnapshotUnsafe().SnapshotTerm {
+				rf.commandLog.Msgs = rf.commandLog.Msgs[:1]
+				rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[0].Msg)
+				IsChangeMsg = true
+			} else if rf.getSnapshotUnsafe().SnapshotValid && rf.pMsgStore.msgs[0].Msg.CommandIndex <= rf.getSnapshotUnsafe().SnapshotIndex {
+			} else {
+				panic("require snapshot ? Access out of bounds")
+			}
 		} else {
 			if rf.pMsgStore.msgs[0].LastTimeTerm == rf.commandLog.Msgs[index].CommandTerm {
 				if index+1 == len(rf.commandLog.Msgs) {
@@ -829,7 +948,8 @@ func (rf *Raft) saveMsg() *LogData {
 						rf.commandLog.Msgs = rf.commandLog.Msgs[:index+2]
 					}
 				}
-				rf.persistUnsafe(rf.getSnapshot())
+				// rf.persistUnsafe(rf.getSnapshotUnsafe())
+				IsChangeMsg = true
 			} else {
 				break
 			}
@@ -837,9 +957,9 @@ func (rf *Raft) saveMsg() *LogData {
 		rf.pMsgStore.msgs = rf.pMsgStore.msgs[1:]
 	}
 	if len(rf.pMsgStore.msgs) != 0 {
-		return rf.pMsgStore.msgs[0]
+		return rf.pMsgStore.msgs[0], IsChangeMsg
 	} else {
-		return nil
+		return nil, IsChangeMsg
 	}
 }
 func (rf *Raft) storeMsg(msg *LogData) {
@@ -861,7 +981,6 @@ func (rf *Raft) storeMsg(msg *LogData) {
 		rf.pMsgStore = &MsgStore{msgs: make([]*LogData, 0), owner: msg.SelfIndex, mu: sync.Mutex{}, term: int32(msg.Msg.CommandTerm)}
 	}
 	rf.pMsgStore.insert(msg)
-	log.Printf("Pmsg:> \n%s", rf.pMsgStore.string())
 }
 func (rf *Raft) logBeginOrResetMsg(log *LogData) {
 
@@ -870,33 +989,50 @@ func (rf *Raft) logBeginOrResetMsg(log *LogData) {
 	}
 
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, log.Msg)
-	rf.persistUnsafe(rf.getSnapshot())
+	rf.raftPeers[rf.me].logIndexTermLock.Lock()
 	rf.raftPeers[rf.me].logIndex = int32(log.Msg.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(log.Msg.CommandTerm)
+	rf.raftPeers[rf.me].logIndexTermLock.Unlock()
+
+	rf.dolog(-1, "LogAppend", log.Msg.string())
 	rf.dolog(-1, "Log", log.Msg.string())
 }
-
-// 期望index从高到低
+func (rf *Raft) LoadSnap(data *LogData) {
+	if data.Msg.SnapshotIndex < rf.getSnapshot().SnapshotIndex {
+		return
+	} else {
+		rf.SnapshotUnsafe(data.Msg.SnapshotIndex, data.Msg.Snapshot)
+	}
+}
 func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
-	// 当对端发来的结构是 msg[0] == nil 时说明没有数据了
-	rf.commandLog.MsgMu.Lock()
-	defer rf.commandLog.MsgMu.Unlock()
+
+	var IsStoreMsg bool = false
+	var IsChangeMsg bool = false
+	rf.commandLog.MsgRwMu.Lock()
+	defer rf.commandLog.MsgRwMu.Unlock()
 
 	if msg[0].Msg.CommandValid {
 		for i := len(msg) - 1; i >= 0; i-- {
 			result := rf.checkMsg(msg[i])
 			switch result {
+			case LogCheckSnap:
+				rf.dolog(-1, "LogCheckSnap", msg[i].string())
+				rf.LoadSnap(msg[i])
 			case LogCheckBeginOrReset:
 				rf.dolog(-1, "LogCheckBeginOrReset", msg[i].string())
 				rf.logBeginOrResetMsg(msg[i])
+				IsChangeMsg = true
 			case LogCheckAppend:
 				rf.dolog(-1, "LogCheckAppend", msg[i].string())
 				rf.appendMsg(msg[i])
+				IsChangeMsg = true
 			case LogCheckIgnore:
 				rf.dolog(-1, "LogCheckIgnore", msg[i].string())
 			case LogCheckStore:
+				IsStoreMsg = true
 				rf.dolog(-1, "LogCheckStore", msg[i].string())
 				rf.storeMsg(msg[i])
+				// IsChangeMsg = true
 			default:
 				rf.pMsgStore.mu.Lock()
 				defer rf.pMsgStore.mu.Unlock()
@@ -905,7 +1041,13 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 			}
 		}
 	}
-	i := rf.saveMsg()
+	i, IsSave := rf.saveMsg()
+	if IsStoreMsg {
+		rf.debugLoger.Printf("Pmsg:> \n%s", rf.pMsgStore.string())
+	}
+	if IsChangeMsg || IsSave {
+		rf.persistUnsafe(rf.getSnapshotUnsafe())
+	}
 	// if i != nil {
 	// 	log.Printf("Return rpl To request msg : %+v\n \nMsg Now:>\n", i.string())
 	// 	for i2, am := range rf.commandLog.Msgs {
@@ -919,11 +1061,14 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 	return i
 }
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.commandLog.MsgMu.Lock()
-	defer rf.commandLog.MsgMu.Unlock()
+	rf.dolog(-1, "Start Called ")
+
 	TermNow := rf.getTerm()
 	LevelNow := rf.getLevel()
-	rf.dolog(-1, "Start Called ")
+
+	rf.commandLog.MsgRwMu.Lock()
+	defer rf.commandLog.MsgRwMu.Unlock()
+
 
 	if LevelNow != LevelLeader {
 		i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), false
@@ -939,11 +1084,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		CommandIndex: rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex + 1}
 
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, newMessage)
+	rf.raftPeers[rf.me].logIndexTermLock.Lock()
 	rf.raftPeers[rf.me].logIndex = int32(newMessage.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(newMessage.CommandTerm)
+	rf.raftPeers[rf.me].logIndexTermLock.Unlock()
+
+	rf.dolog(-1, "LogAppend", newMessage.string())
 
 	rf.dolog(-1, "Start TO LogAppend", newMessage.string())
-	rf.persistUnsafe(rf.getSnapshot())
+	rf.persistUnsafe(rf.getSnapshotUnsafe())
 
 	arg = &RequestArgs{
 		SelfTerm:  TermNow,
@@ -951,8 +1100,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		SelfIndex: int32(rf.me),
 		Msg: append(make([]*LogData, 0),
 			&LogData{
-				Msg:       newMessage,
-				SelfIndex: rf.me}),
+				Msg:         newMessage,
+				SelfIndex:   rf.me,
+				SelfTermNow: int(TermNow)}),
 	}
 
 	if rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandValid {
@@ -961,24 +1111,27 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		arg.LastLogIndex, arg.LastLogTerm = int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotTerm)
 	}
 
-	if len(rf.commandLog.Msgs)-1 <= 0 {
-		arg.Msg[0].LastTimeIndex = 0
-		arg.Msg[0].LastTimeTerm = -1
-	} else {
+	if len(rf.commandLog.Msgs) > 1 {
 		arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandIndex
 		arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandTerm
+	} else {
+		if rf.commandLog.Msgs[0].SnapshotValid {
+			arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[0].SnapshotIndex
+			arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[0].SnapshotTerm
+		} else {
+			arg.Msg[0].LastTimeIndex = 0
+			arg.Msg[0].LastTimeTerm = -1
+		}
 	}
 
 	for i := range rf.raftPeers {
-		if i == rf.me {
-			continue
-		} else {
+		if i != rf.me {
 			go func(index int) {
 				rpl := &RequestReply{}
-				// select {
-				// case rf.raftPeers[index].JumpHeartBeat <- struct{}{}:
-				// default:
-				// }
+				select {
+				case rf.raftPeers[index].JumpHeartBeat <- struct{}{}:
+				default:
+				}
 				rf.dolog(index, "Raft.Heartbeat[LoadMsgBegin]", arg.string())
 				ok := rf.call(index, "Raft.HeartBeat", arg, rpl)
 				switch {
@@ -989,8 +1142,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				case rpl.LogDataMsg != nil:
 					rf.tryleaderUpdatePeer(index, rpl.LogDataMsg)
 				default:
+					rf.raftPeers[index].logIndexTermLock.Lock()
+					rf.raftPeers[index].lastLogTerm = rpl.PeerLastLogTerm
+					rf.raftPeers[index].logIndex = rpl.PeerLastLogIndex
+					rf.raftPeers[index].logIndexTermLock.Unlock()
 				}
 			}(i)
+		} else {
+			continue
 		}
 	}
 	i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), LevelNow == LevelLeader
@@ -998,79 +1157,93 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return i, m, l
 }
 
-func (r *Raft) getLog(index int) (*ApplyMsg, *ApplyMsg) {
-	r.commandLog.MsgMu.Lock()
-	defer r.commandLog.MsgMu.Unlock()
-	targetIndex := len(r.commandLog.Msgs) - (r.commandLog.Msgs[len(r.commandLog.Msgs)-1].CommandIndex - index) - 1
-	if targetIndex < 0 {
-		panic("Request target index < 0 ")
-	} else if targetIndex == 0 {
-		return nil, nil
-	} else if targetIndex >= len(r.commandLog.Msgs) {
-		panic("follow's Log Newer than Leader ")
-	} else {
-		if targetIndex-1 <= 0 {
-			return nil, r.commandLog.Msgs[targetIndex]
-		} else {
-			return r.commandLog.Msgs[targetIndex-1], r.commandLog.Msgs[targetIndex]
-		}
+func (r *Raft) getLog(index int) []*LogData {
+
+	r.commandLog.MsgRwMu.RLock()
+	defer r.commandLog.MsgRwMu.RUnlock()
+	termNow := r.getTerm()
+	targetLogIndexEnd := r.GetTargetCacheIndex(index)
+	if targetLogIndexEnd < 0 {
+		// panic("Request target index < 0 ")
+		targetLogIndexEnd = 0
+	} else if targetLogIndexEnd >= len(r.commandLog.Msgs) {
+		panic("Request target index out of range ")
 	}
+	targetLogIndexBegin := targetLogIndexEnd - UpdateLogLines
+	result := make([]*LogData, 0)
+	if targetLogIndexBegin <= 0 {
+		if r.commandLog.Msgs[0].SnapshotValid {
+			result = append(result, &LogData{Msg: r.commandLog.Msgs[0], SelfIndex: r.me, SelfTermNow: int(termNow)})
+		}
+		targetLogIndexBegin = 1
+	}
+	for targetLogIndexBegin <= targetLogIndexEnd {
+		result = append(result, &LogData{
+			SelfTermNow: int(termNow),
+			Msg:         r.commandLog.Msgs[targetLogIndexBegin],
+			SelfIndex:   r.me})
+		if r.commandLog.Msgs[targetLogIndexBegin-1].CommandValid {
+			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm =
+				r.commandLog.Msgs[targetLogIndexBegin-1].CommandIndex, r.commandLog.Msgs[targetLogIndexBegin-1].CommandTerm
+		} else if r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotValid {
+			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm =
+				r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotIndex, r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotTerm
+		}
+		targetLogIndexBegin++
+	}
+	return result
 
 }
 func (r *Raft) tryleaderUpdatePeer(index int, msg *LogData) {
 	if r.raftPeers[index].modeLock.TryLock() {
 		go r.leaderUpdatePeer(index, msg)
-	} else {
-		return
 	}
 }
 func (r *Raft) leaderUpdatePeer(index int, msg *LogData) {
 	defer r.raftPeers[index].modeLock.Unlock()
-	r.dolog(index, "leaderUpdatePeer Get RQ")
+	r.dolog(index, "leaderUpdate: leaderUpdatePeer Get RQ")
 	arg := RequestArgs{
 		SelfTerm:  r.getTerm(),
 		SelfIndex: int32(r.me),
-		Msg:       append(make([]*LogData, 0), &LogData{SelfIndex: r.me}),
+		// Msg:       append(make([]*LogData, 0), &LogData{SelfIndex: r.me}),
 	}
-	arg.LastLogIndex, arg.LastLogTerm = r.getLastLogData()
 	for {
+		arg.LastLogIndex, arg.LastLogTerm = r.getLastLogData()
 		arg.Time = time.Now()
 		if r.getLevel() != LevelLeader {
 			break
 		}
-		preMsgNeedSend, MsgNeedSend := r.getLog(msg.LastTimeIndex)
-		if MsgNeedSend != nil {
-			arg.Msg[0].Msg = MsgNeedSend
-			if preMsgNeedSend != nil {
-				arg.Msg[0].LastTimeIndex = preMsgNeedSend.CommandIndex
-				arg.Msg[0].LastTimeTerm = preMsgNeedSend.CommandTerm
-			} else {
-				arg.Msg[0].LastTimeIndex = 0
-				arg.Msg[0].LastTimeTerm = -1
-			}
+
+		arg.Msg = r.getLog(msg.LastTimeIndex)
+		arg.CommitIndex = r.getCommitIndex()
+		rpl := RequestReply{}
+		r.dolog(index, "leaderUpdate: HeartBeat(Update) Go ", arg.string())
+
+		select {
+		case r.raftPeers[index].JumpHeartBeat <- struct{}{}:
+		default:
 		}
 
-		rpl := RequestReply{}
-		r.dolog(index, "HeartBeat(Update) Go ", arg.string())
-		ok := r.call(index, "Raft.HeartBeat", &arg, &rpl)
-		r.dolog(index, "HeartBeat(Update) return ", rpl.string())
+		// 没有超时机制
+		ok := r.raftPeers[index].C.Call("Raft.HeartBeat", &arg, &rpl)
+
+		r.dolog(index, "leaderUpdate: HeartBeat(Update) return ", rpl.string())
 
 		if !ok {
-			r.dolog(index, "HeartBeat(Update) Timeout", arg.string())
+			r.dolog(index, "leaderUpdate: HeartBeat(Update) Timeout CallFalse", arg.string())
 			break
 		} else if !rpl.IsAgree {
-			r.dolog(index, "HeartBeat(Update) DisAgree", rpl.string())
+			r.dolog(index, "leaderUpdate: HeartBeat(Update) DisAgree", rpl.string())
 			break
 		} else if rpl.LogDataMsg != nil {
-
-			r.dolog(index, "HeartBeat(Update) ReWriteCacheToGetNextOne", rpl.string())
+			r.dolog(index, "leaderUpdate: HeartBeat(Update) ReWriteCacheToGetNextOne", rpl.string())
 			msg = rpl.LogDataMsg
 		} else {
-			r.dolog(index, "HeartBeat(Update) UpdateDone", rpl.string())
+			r.dolog(index, "leaderUpdate: HeartBeat(Update) UpdateDone", rpl.string())
 			break
 		}
 	}
-	r.dolog(index, "Update Done")
+	r.dolog(index, "leaderUpdate: Update Done")
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -1142,6 +1315,8 @@ func (rf *Raft) ticker() {
 func TryToBecomeLeader(rf *Raft) {
 	rf.changeToCandidate()
 	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me)}
+
+	// 这里要拿日志锁
 	arg.LastLogIndex, arg.LastLogTerm = rf.getLastLogData()
 
 	rpl := make([]RequestReply, len(rf.peers))
@@ -1152,7 +1327,7 @@ func TryToBecomeLeader(rf *Raft) {
 			go func(index int) {
 				rf.dolog(index, "Raft.RequestPreVote  GO ", index, arg.string())
 				ok := rf.call(index, "Raft.RequestPreVote", &arg, &rpl[index])
-				rf.dolog(index, "Raft.RequestPreVote RETURN ", index, ok, rpl[index].string())
+				rf.dolog(index, "Raft.RequestPreVote RETURN ", ok, rpl[index].IsAgree, rpl[index].string())
 				wg.Done()
 			}(i)
 		}
@@ -1161,7 +1336,7 @@ func TryToBecomeLeader(rf *Raft) {
 	count := 1
 	for i := range rpl {
 		if i != rf.me {
-			if rpl[i].PeerSelfTerm >= arg.SelfTerm || rpl[i].PeerLastLogTerm > arg.LastLogTerm || (rpl[i].PeerLastLogTerm == arg.LastLogTerm && rpl[i].PeerLastLogIndex > rf.getLogIndex()) {
+			if rpl[i].PeerLastLogTerm > arg.LastLogTerm || (rpl[i].PeerLastLogTerm == arg.LastLogTerm && rpl[i].PeerLastLogIndex > rf.getLogIndex()) {
 				// timeout case
 				if rpl[i].PeerLastLogTerm == 0 && rpl[i].PeerLastLogIndex == 0 {
 					continue
@@ -1175,20 +1350,22 @@ func TryToBecomeLeader(rf *Raft) {
 		}
 	}
 	if count > len(rf.peers)/2 {
-		rf.setTerm(arg.SelfTerm)
 		// 在这之前对其他的投票了
 		// arg.SelfTerm = rf.getTerm()
+		rf.setTerm(arg.SelfTerm)
 	} else {
 		rf.changeToFollower(nil)
 		return
 	}
+	rpl = make([]RequestReply, len(rf.peers))
+
 	for i := range rf.raftPeers {
 		if i != rf.me {
 			wg.Add(1)
 			go func(index int) {
-				rf.dolog(index, "Raft.RequestVote", arg.string())
+				rf.dolog(index, "Raft.RequestVote GO ", arg.string())
 				ok := rf.call(index, "Raft.RequestVote", &arg, &rpl[index])
-				rf.dolog(index, "Raft.RequestVote", ok, rpl[index].string())
+				rf.dolog(index, "Raft.RequestVote RETUEN ", ok, rpl[index].IsAgree, rpl[index].string())
 				wg.Done()
 			}(i)
 		}
@@ -1197,7 +1374,7 @@ func TryToBecomeLeader(rf *Raft) {
 	count = 1
 	for i := range rpl {
 		if i != rf.me {
-			if rpl[i].PeerSelfTerm >= arg.SelfTerm || rpl[i].PeerLastLogTerm > arg.LastLogTerm || (rpl[i].PeerLastLogTerm == arg.LastLogTerm && rpl[i].PeerLastLogIndex > rf.getLogIndex()) {
+			if rpl[i].PeerLastLogTerm > arg.LastLogTerm || (rpl[i].PeerLastLogTerm == arg.LastLogTerm && rpl[i].PeerLastLogIndex > rf.getLogIndex()) {
 				// timeout case
 				if rpl[i].PeerLastLogTerm == 0 && rpl[i].PeerLastLogIndex == 0 {
 					continue
@@ -1210,20 +1387,35 @@ func TryToBecomeLeader(rf *Raft) {
 			}
 		}
 	}
-	if count < len(rf.peers)/2 {
+	if count > len(rf.peers)/2 {
+		for i := range rpl {
+			if i != rf.me && rpl[i].IsAgree {
+				rf.raftPeers[i].logIndexTermLock.Lock()
+				rf.raftPeers[i].lastLogTerm, rf.raftPeers[i].logIndex = rpl[i].PeerLastLogIndex, rpl[i].PeerLastLogTerm
+				rf.raftPeers[i].logIndexTermLock.Unlock()
+			}
+		}
+		rf.changeToLeader()
+	} else {
 		rf.changeToFollower(nil)
 		return
-	} else {
-		rf.changeToLeader()
 	}
 }
 
 func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestReply) bool {
+	asdf := time.Now().UnixNano()
+
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeOut)
 	defer cancel()
 	i := false
 	go func() {
+		if arg.Msg != nil && len(arg.Msg) > 1 {
+			r.dolog(-1, asdf, "UPdate rpcGo", arg.string())
+		}
 		i = r.peers[index].Call(FuncName, arg, rpl)
+		if arg.Msg != nil && len(arg.Msg) > 1 {
+			r.dolog(-1, asdf, "UPdate rpcReturn", rpl.string())
+		}
 		cancel()
 	}()
 	select {
@@ -1233,6 +1425,36 @@ func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestRe
 	}
 	return i
 }
+//    type Raft struct {
+//        mu        sync.Mutex          // Lock to protect shared access to this peer's state
+//        peers     []*labrpc.ClientEnd // RPC end points of all peers
+//        persister *Persister          // Object to hold this peer's persisted state
+//        me        int                 // this peer's index into peers[]
+//        dead      int32               // set by Kill()
+//    
+//        isLeaderAlive int32 //
+//        level         int32 //
+//    
+//        commitIndex      int32      //
+//        commitIndexMutex sync.Mutex //
+//    
+//        term            int32 //
+//        termLock        sync.Locker
+//        timeOutChan     chan struct{}
+//        levelChangeChan chan struct{}
+//        raftPeers       []RaftPeer
+//        // Your data here (2A, 2B, 2C).
+//        commandLog Log
+//        // Look at the paper's Figure 2 for a description of what
+//        // state a Raft server must maintain.
+//        commitChan          chan int32
+//        pMsgStore           *MsgStore // nil
+//        pMsgStoreCreateLock sync.Mutex
+//    
+//        KilledChan chan bool
+//    
+//        debugLoger *log.Logger
+//    }
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	os.Stderr.WriteString("Raft Make \n")
 	rf := &Raft{}
@@ -1248,10 +1470,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.levelChangeChan = make(chan struct{}, 1)
 	rf.raftPeers = make([]RaftPeer, len(rf.peers))
 	rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), &ApplyMsg{CommandValid: true, Command: nil, CommandIndex: 0, CommandTerm: -1, SnapshotValid: false, Snapshot: nil, SnapshotTerm: -1, SnapshotIndex: -1})
-	rf.commandLog.MsgMu = sync.Mutex{}
+	rf.commandLog.MsgRwMu = sync.RWMutex{}
 	rf.pMsgStoreCreateLock = sync.Mutex{}
 	rf.KilledChan = make(chan bool, 100)
-	rf.termLock = &sync.Mutex{}
+	rf.termLock = sync.Mutex{}
 
 	file, err := os.OpenFile(fmt.Sprintf("/home/wang/raftLog/raft_%d.R", os.Getpid()), os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -1282,43 +1504,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.Debugticker()
 	go rf.committer(applyCh)
 	return rf
 }
-
-func (rf *Raft) Debugticker() {
-	for {
-		time.Sleep(500 * time.Millisecond)
-		if _, ok := <-rf.KilledChan; ok {
-			return
-		}
-		if rf.commandLog.MsgMu.TryLock() {
-			if len(rf.commandLog.Msgs) != 1 {
-				l := "\t\t\t\t\trf.commandLog :\n"
-				for i := range rf.commandLog.Msgs {
-					l += "\t\t\t\t\t\t" + rf.commandLog.Msgs[i].string() + "\n"
-				}
-				rf.debugLoger.Printf(l)
-			}
-			rf.commandLog.MsgMu.Unlock()
-		}
-		if rf.pMsgStoreCreateLock.TryLock() {
-			if rf.pMsgStore != nil {
-				if rf.pMsgStore.mu.TryLock() {
-					l := "\t\t\t\t\trf.pMsgStore.msgs"
-					for i := range rf.pMsgStore.msgs {
-						l += "\t\t\t\t\t\t" + rf.pMsgStore.msgs[i].string() + "\n"
-					}
-					rf.debugLoger.Printf(l)
-					rf.pMsgStore.mu.Unlock()
-				}
-			}
-			rf.pMsgStoreCreateLock.Unlock()
-		}
-	}
-}
-
+ 
 type peersLogSlice []peersLog
 type peersLog struct {
 	term  int32
@@ -1359,8 +1548,10 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 		case <-time.After(100 * time.Millisecond):
 			if rf.getLevel() == LevelLeader {
 				for i := range rf.raftPeers {
-					peerLogedIndexs[i].index = atomic.LoadInt32(&rf.raftPeers[i].logIndex)
-					peerLogedIndexs[i].term = atomic.LoadInt32(&rf.raftPeers[i].lastLogTerm)
+					rf.raftPeers[i].logIndexTermLock.Lock()
+					peerLogedIndexs[i].index = rf.raftPeers[i].logIndex
+					peerLogedIndexs[i].term = rf.raftPeers[i].lastLogTerm
+					rf.raftPeers[i].logIndexTermLock.Unlock()
 				}
 				sort.Sort(peersLogSlice(peerLogedIndexs))
 				ToLogHalfIndex := peerLogedIndexs[(len(peerLogedIndexs))/2]
@@ -1379,6 +1570,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 		case ToLogIndex, ok = <-rf.commitChan:
 			if rf.getLevel() == LevelLeader {
 				rf.dolog(-1, "Committer: FALAT err: leader Get CommitChan returned")
+				os.Exit(1)
 			}
 			if !ok {
 				return
@@ -1392,34 +1584,33 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 			ToLogIndex = LogedIndex
 			continue
 		} else {
-			for exceptLogMsgIndex := LogedIndex + 1; exceptLogMsgIndex <= ToLogIndex; exceptLogMsgIndex++ {
-
-				findLogSuccess, expectedLogMsgCacheIndex :=
-					func() (bool, int32) {
-						rf.commandLog.MsgMu.Lock()
-						defer rf.commandLog.MsgMu.Unlock()
+			findLogSuccess, expectedLogMsgCacheIndex, exceptLogMsgIndex :=
+				func() (bool, int32, int32) {
+					rf.commandLog.MsgRwMu.RLock()
+					defer rf.commandLog.MsgRwMu.RUnlock()
+					for exceptLogMsgIndex := LogedIndex + 1; exceptLogMsgIndex <= ToLogIndex; exceptLogMsgIndex++ {
 						// get cache index
-						expectedLogMsgCacheIndex := int32(len(rf.commandLog.Msgs)) - (int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex) - exceptLogMsgIndex) - 1
+						expectedLogMsgCacheIndex := int32(rf.GetTargetCacheIndex(int(exceptLogMsgIndex)))
 						// out of range
 						if expectedLogMsgCacheIndex <= 0 || expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
-							return false, expectedLogMsgCacheIndex
+							return false, expectedLogMsgCacheIndex, exceptLogMsgIndex
 						} else {
 							// commit operation
 							applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]
 
 							rf.dolog(-1, fmt.Sprintf("Committer: Commit log message CacheIndex:[%d] Index[%d] %s", expectedLogMsgCacheIndex, exceptLogMsgIndex, rf.commandLog.Msgs[expectedLogMsgCacheIndex].string()))
 							LogedIndex = exceptLogMsgIndex
-							rf.setCommitIndex(LogedIndex)
-							time.Sleep(10 * time.Millisecond)
+							rf.justSetCommitIndex(LogedIndex)
 						}
-						return true, -1
-					}()
-				if !findLogSuccess {
-					//log
-					rf.dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
-					break
-				}
+					}
+					return true, -1, -1
+				}()
+			if !findLogSuccess {
+				//log
+				rf.dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
+				continue
 			}
+			rf.setCommitIndex(LogedIndex)
 		}
 	}
 }
