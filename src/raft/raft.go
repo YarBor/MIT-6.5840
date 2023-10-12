@@ -32,8 +32,30 @@ import (
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
-	// "golang.org/x/tools/go/analysis/passes/nilfunc"
 )
+
+func (r *Raft) checkFuncDone(FuncName string) func() {
+	t := time.Now().UnixNano()
+	i := make(chan bool, 1)
+	i2 := make(chan bool, 1)
+	go func() {
+		r.dolog(-1, t, FuncName+" GO")
+		i2 <- true
+		for {
+			select {
+			case <-time.After(rpcTimeOut * 2 * time.Millisecond):
+				r.dolog(-1, "\n", t, "!!!!\t", FuncName+" MayLocked\n")
+			case <-i:
+				return
+			}
+		}
+	}()
+	<-i2
+	return func() {
+		i <- true
+		r.dolog(-1, t, FuncName+" return")
+	}
+}
 
 const (
 	LevelLeader    = int32(3)
@@ -118,9 +140,9 @@ type ApplyMsg struct {
 
 	// For 2D:
 	SnapshotValid bool
-	Snapshot      []byte
 	SnapshotTerm  int
 	SnapshotIndex int
+	Snapshot      []byte
 }
 
 // a pieces of Server Talk
@@ -243,11 +265,9 @@ func (r *Raft) getSnapshot() *ApplyMsg {
 	defer r.commandLog.MsgRwMu.RUnlock()
 	return r.getSnapshotUnsafe()
 }
-// unsafe 
+
+// unsafe
 func (r *Raft) getSnapshotUnsafe() *ApplyMsg {
-	if r.commandLog.Msgs[0] == nil || r.commandLog.Msgs[0].Snapshot == nil {
-		return nil
-	}
 	r.dolog(-1, fmt.Sprintf("Get SnapShot index[%d] , term[%d]", r.commandLog.Msgs[0].SnapshotIndex, r.commandLog.Msgs[0].SnapshotTerm))
 	return r.commandLog.Msgs[0]
 }
@@ -264,10 +284,10 @@ func (r *Raft) getLogIndex() int32 {
 	return r.getLogIndexUnsafe()
 }
 func (r *Raft) getLogIndexUnsafe() int32 {
-	if r.commandLog.Msgs[len(r.commandLog.Msgs)-1].CommandValid {
-		return int32(r.commandLog.Msgs[len(r.commandLog.Msgs)-1].CommandIndex)
-	} else {
+	if r.commandLog.Msgs[len(r.commandLog.Msgs)-1].SnapshotValid {
 		return int32(r.commandLog.Msgs[len(r.commandLog.Msgs)-1].SnapshotIndex)
+	} else {
+		return int32(r.commandLog.Msgs[len(r.commandLog.Msgs)-1].CommandIndex)
 	}
 }
 
@@ -400,12 +420,12 @@ func (r *Raft) changeToFollower(rpl *RequestReply) {
 	if r.getLevel() == LevelLeader {
 		r.stopSendHeartBeat()
 	}
+	r.setLevel(LevelFollower)
 	if rpl != nil {
 		if rpl.PeerSelfTerm > r.getTerm() {
 			r.setTerm(rpl.PeerSelfTerm)
 		}
 	}
-	r.setLevel(LevelFollower)
 	select {
 	case r.levelChangeChan <- struct{}{}:
 	default:
@@ -476,6 +496,7 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist(snapshot *ApplyMsg) {
+	defer rf.checkFuncDone("persist")()
 
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
@@ -485,6 +506,7 @@ func (rf *Raft) persist(snapshot *ApplyMsg) {
 
 // 此函数不保证对log的操作的原子性
 func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
+	defer rf.checkFuncDone("persistUnsafe")()
 	if snapshot != nil {
 		if snapshot.SnapshotIndex < rf.commandLog.Msgs[0].SnapshotIndex {
 			return
@@ -493,7 +515,7 @@ func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
 
 	buffer := bytes.Buffer{}
 	encoder := labgob.NewEncoder(&buffer)
-	err := encoder.Encode(atomic.LoadInt32(&rf.commitIndex))
+	err := encoder.Encode(rf.getSnapshotUnsafe().CommandIndex)
 	if err != nil {
 		log.Fatal("Failed to encode CommitIndex: ", err)
 	}
@@ -525,7 +547,7 @@ func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
 	rf.debugLoger.Println("\nPersist Save - " + output)
 }
 
-// Unsafe 	
+// Unsafe
 func showMsgS(rf []*ApplyMsg) string {
 	str := "\n"
 	for i := range rf {
@@ -606,36 +628,53 @@ func (rf *Raft) GetTargetCacheIndex(index int) int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	defer rf.checkFuncDone("Snapshot")()
+
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
-	rf.SnapshotUnsafe(index, snapshot)
+	rf.SnapshotUnsafe(index, -1, snapshot)
 }
 
-func (rf *Raft) SnapshotUnsafe(index int, snapshot []byte) {
+func (rf *Raft) SnapshotUnsafe(index int, InputSnapShotTerm int, snapshot []byte) {
 	// Your code here (2D).
-	rf.dolog(-1, "snapshot Index:%v", index)
-	if index < rf.commandLog.Msgs[0].SnapshotIndex {
+	defer rf.checkFuncDone("SnapshotUnsafe")()
+	rf.dolog(-1, fmt.Sprintf("Try save snapshot Index:%v  data :%v", index, snapshot))
+	if (InputSnapShotTerm != -1 && InputSnapShotTerm < rf.getSnapshotUnsafe().SnapshotTerm) || index <= rf.getSnapshotUnsafe().SnapshotIndex {
 		return
 	}
-	if rf.GetTargetCacheIndex(index) <= 0 || rf.GetTargetCacheIndex(index) > len(rf.commandLog.Msgs) {
+
+	inputIndexSCacheIndex := rf.GetTargetCacheIndex(index)
+
+	var newMagsHead *ApplyMsg
+	if inputIndexSCacheIndex < 0 {
 		panic("Snapshot Called, But Not found correspond Log")
+	} else if inputIndexSCacheIndex >= len(rf.commandLog.Msgs) {
+		// rf.dolog(-1, "Snapshot called but not found correspond Log , inputIndexSCacheIndex >= len(rf.commandLog.Msgs)", "index", index, "inputIndexSCacheIndex", inputIndexSCacheIndex, "len(rf.commandLog.Msgs)", len(rf.commandLog.Msgs))
+		if InputSnapShotTerm == -1 {
+			return
+		} else {
+			newMagsHead = &ApplyMsg{CommandValid: false, Command: nil, CommandIndex: 0, CommandTerm: -1, SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: InputSnapShotTerm, SnapshotIndex: index}
+		}
+	} else {
+		term := rf.commandLog.Msgs[inputIndexSCacheIndex].CommandTerm
+		if InputSnapShotTerm != -1 && InputSnapShotTerm > term {
+			term = InputSnapShotTerm
+		}
+		newMagsHead = &ApplyMsg{CommandValid: false, Command: nil, CommandIndex: 0, CommandTerm: -1, SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: term, SnapshotIndex: index}
 	}
-	cacheIndex := rf.GetTargetCacheIndex(index)
-	if cacheIndex < 0 {
-		panic("SnapShot Index Out of Range")
-	}
-	newMagsHead := ApplyMsg{CommandValid: true, Command: nil, CommandIndex: 0, CommandTerm: -1, SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: rf.commandLog.Msgs[rf.GetTargetCacheIndex(index)].CommandTerm, SnapshotIndex: index}
-	if cacheIndex >= len(rf.commandLog.Msgs) {
-		rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), &newMagsHead)
+
+	if inputIndexSCacheIndex >= len(rf.commandLog.Msgs) {
+		rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), newMagsHead)
 	} else {
 		oldMsgs := rf.commandLog.Msgs
 		if len(oldMsgs) > 1 {
-			rf.commandLog.Msgs = append(append(make([]*ApplyMsg, 0), &newMagsHead), oldMsgs[1:cacheIndex+1]...)
+			rf.commandLog.Msgs = append(append(make([]*ApplyMsg, 0), newMagsHead), oldMsgs[inputIndexSCacheIndex+1:]...)
 		} else {
-			rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), &newMagsHead)
+			rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), newMagsHead)
 		}
 	}
 	rf.persistUnsafe(rf.commandLog.Msgs[0])
+	rf.dolog(-1, fmt.Sprintf("Saved snapshot Index:%v  data :%v", index, snapshot))
 }
 
 func (r *RequestArgs) string() string {
@@ -659,6 +698,7 @@ func (r *RequestReply) string() string {
 }
 
 func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
+	defer r.checkFuncDone("RequestPreVote")()
 	reply.PeerLastLogIndex, reply.PeerLastLogTerm = r.getLastLogData()
 	reply.PeerSelfTerm = r.getTerm()
 	reply.ReturnTime = time.Now()
@@ -667,6 +707,7 @@ func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
 }
 
 func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
+	defer rf.checkFuncDone("RequestVote")()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.termLock.Lock()
@@ -841,6 +882,9 @@ func (rf *Raft) getLastLogData() (int32, int32) {
 
 	rf.commandLog.MsgRwMu.RLock()
 	defer rf.commandLog.MsgRwMu.RUnlock()
+	if rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotValid {
+		return int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotTerm)
+	}
 	return int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandTerm)
 }
 
@@ -911,8 +955,8 @@ func (rf *Raft) saveMsg() (*LogData, bool) {
 		panic("rf.pMsgStore.msgs is not initialized , May race state result")
 
 		// 有快照之前的追加
-	} else if rf.pMsgStore.msgs[0].LastTimeTerm == -1 {
-		rf.commandLog.Msgs = rf.commandLog.Msgs[:1]
+	} else if !rf.getSnapshotUnsafe().SnapshotValid && rf.pMsgStore.msgs[0].LastTimeTerm == -1 {
+		rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), rf.commandLog.Msgs[:1]...)
 		rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[0].Msg)
 		rf.pMsgStore.msgs = rf.pMsgStore.msgs[1:]
 		// rf.pMsgStore.msgs = make([]*LogData, 0)
@@ -924,19 +968,21 @@ func (rf *Raft) saveMsg() (*LogData, bool) {
 		if len(rf.pMsgStore.msgs) == 0 {
 			break
 		}
+		rf.dolog(-1, "Try Save "+rf.pMsgStore.msgs[0].string())
 		index := rf.GetTargetCacheIndex(rf.pMsgStore.msgs[0].LastTimeIndex)
 		if index >= len(rf.commandLog.Msgs) {
 			break
 		} else if index <= 0 {
-			if rf.getSnapshotUnsafe().SnapshotValid &&
-				rf.pMsgStore.msgs[0].LastTimeIndex == rf.getSnapshotUnsafe().SnapshotIndex &&
-				rf.pMsgStore.msgs[0].LastTimeTerm == rf.getSnapshotUnsafe().SnapshotTerm {
-				rf.commandLog.Msgs = rf.commandLog.Msgs[:1]
-				rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[0].Msg)
-				IsChangeMsg = true
-			} else if rf.getSnapshotUnsafe().SnapshotValid && rf.pMsgStore.msgs[0].Msg.CommandIndex <= rf.getSnapshotUnsafe().SnapshotIndex {
+			if rf.getSnapshotUnsafe().SnapshotValid && rf.pMsgStore.msgs[0].LastTimeIndex == rf.getSnapshotUnsafe().SnapshotIndex && rf.pMsgStore.msgs[0].LastTimeTerm == rf.getSnapshotUnsafe().SnapshotTerm {
+				if len(rf.commandLog.Msgs) > 2 && (rf.pMsgStore.msgs[0].Msg.CommandIndex == rf.commandLog.Msgs[1].CommandIndex && rf.pMsgStore.msgs[0].Msg.CommandTerm == rf.commandLog.Msgs[1].CommandTerm) {
+				} else {
+					rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), rf.commandLog.Msgs[:1]...)
+					rf.commandLog.Msgs = append(rf.commandLog.Msgs, rf.pMsgStore.msgs[0].Msg)
+					IsChangeMsg = true
+				}
+			} else if !rf.getSnapshotUnsafe().SnapshotValid || rf.pMsgStore.msgs[0].Msg.CommandIndex > rf.getSnapshotUnsafe().SnapshotIndex {
+				log.Panic("require snapshot ? Access out of bounds")
 			} else {
-				panic("require snapshot ? Access out of bounds")
 			}
 		} else {
 			if rf.pMsgStore.msgs[0].LastTimeTerm == rf.commandLog.Msgs[index].CommandTerm {
@@ -954,15 +1000,18 @@ func (rf *Raft) saveMsg() (*LogData, bool) {
 				break
 			}
 		}
+		rf.dolog(-1, "Saved "+rf.pMsgStore.msgs[0].string())
 		rf.pMsgStore.msgs = rf.pMsgStore.msgs[1:]
 	}
 	if len(rf.pMsgStore.msgs) != 0 {
 		return rf.pMsgStore.msgs[0], IsChangeMsg
 	} else {
+		rf.pMsgStore.msgs = make([]*LogData, 0)
 		return nil, IsChangeMsg
 	}
 }
 func (rf *Raft) storeMsg(msg *LogData) {
+	defer rf.checkFuncDone("storeMsg")()
 	rf.pMsgStoreCreateLock.Lock()
 	defer rf.pMsgStoreCreateLock.Unlock()
 	if msg == nil {
@@ -998,47 +1047,46 @@ func (rf *Raft) logBeginOrResetMsg(log *LogData) {
 	rf.dolog(-1, "Log", log.Msg.string())
 }
 func (rf *Raft) LoadSnap(data *LogData) {
-	if data.Msg.SnapshotIndex < rf.getSnapshot().SnapshotIndex {
+	if data.Msg.SnapshotIndex < rf.getSnapshotUnsafe().SnapshotIndex {
 		return
 	} else {
-		rf.SnapshotUnsafe(data.Msg.SnapshotIndex, data.Msg.Snapshot)
+		rf.SnapshotUnsafe(data.Msg.SnapshotIndex, data.Msg.SnapshotTerm, data.Msg.Snapshot)
 	}
 }
 func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
+	defer rf.checkFuncDone("updateMsgs")()
 
 	var IsStoreMsg bool = false
 	var IsChangeMsg bool = false
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
 
-	if msg[0].Msg.CommandValid {
-		for i := len(msg) - 1; i >= 0; i-- {
-			result := rf.checkMsg(msg[i])
-			switch result {
-			case LogCheckSnap:
-				rf.dolog(-1, "LogCheckSnap", msg[i].string())
-				rf.LoadSnap(msg[i])
-			case LogCheckBeginOrReset:
-				rf.dolog(-1, "LogCheckBeginOrReset", msg[i].string())
-				rf.logBeginOrResetMsg(msg[i])
-				IsChangeMsg = true
-			case LogCheckAppend:
-				rf.dolog(-1, "LogCheckAppend", msg[i].string())
-				rf.appendMsg(msg[i])
-				IsChangeMsg = true
-			case LogCheckIgnore:
-				rf.dolog(-1, "LogCheckIgnore", msg[i].string())
-			case LogCheckStore:
-				IsStoreMsg = true
-				rf.dolog(-1, "LogCheckStore", msg[i].string())
-				rf.storeMsg(msg[i])
-				// IsChangeMsg = true
-			default:
-				rf.pMsgStore.mu.Lock()
-				defer rf.pMsgStore.mu.Unlock()
-				rf.dolog(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
-				log.Panic(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
-			}
+	for i := 0; i < len(msg); i++ {
+		result := rf.checkMsg(msg[i])
+		switch result {
+		case LogCheckSnap:
+			rf.dolog(-1, "LogCheckSnap", msg[i].string())
+			rf.LoadSnap(msg[i])
+		case LogCheckBeginOrReset:
+			rf.dolog(-1, "LogCheckBeginOrReset", msg[i].string())
+			rf.logBeginOrResetMsg(msg[i])
+			IsChangeMsg = true
+		case LogCheckAppend:
+			rf.dolog(-1, "LogCheckAppend", msg[i].string())
+			rf.appendMsg(msg[i])
+			IsChangeMsg = true
+		case LogCheckIgnore:
+			rf.dolog(-1, "LogCheckIgnore", msg[i].string())
+		case LogCheckStore:
+			IsStoreMsg = true
+			rf.dolog(-1, "LogCheckStore", msg[i].string())
+			rf.storeMsg(msg[i])
+			// IsChangeMsg = true
+		default:
+			rf.pMsgStore.mu.Lock()
+			defer rf.pMsgStore.mu.Unlock()
+			rf.dolog(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
+			log.Panic(-1, "The requested data is out of bounds ", rf.pMsgStore.string(), "RequestIndex:>", rf.pMsgStore.msgs[0].LastTimeIndex, "process will be killed")
 		}
 	}
 	i, IsSave := rf.saveMsg()
@@ -1061,6 +1109,7 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 	return i
 }
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	defer rf.checkFuncDone("Start")()
 	rf.dolog(-1, "Start Called ")
 
 	TermNow := rf.getTerm()
@@ -1068,7 +1117,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
-
 
 	if LevelNow != LevelLeader {
 		i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), false
@@ -1081,15 +1129,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		CommandTerm:  int(TermNow),
 		CommandValid: true,
 		Command:      command,
-		CommandIndex: rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex + 1}
+		CommandIndex: int(rf.getLogIndexUnsafe()) + 1}
 
 	rf.commandLog.Msgs = append(rf.commandLog.Msgs, newMessage)
 	rf.raftPeers[rf.me].logIndexTermLock.Lock()
 	rf.raftPeers[rf.me].logIndex = int32(newMessage.CommandIndex)
 	rf.raftPeers[rf.me].lastLogTerm = int32(newMessage.CommandTerm)
 	rf.raftPeers[rf.me].logIndexTermLock.Unlock()
-
-	rf.dolog(-1, "LogAppend", newMessage.string())
 
 	rf.dolog(-1, "Start TO LogAppend", newMessage.string())
 	rf.persistUnsafe(rf.getSnapshotUnsafe())
@@ -1105,23 +1151,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				SelfTermNow: int(TermNow)}),
 	}
 
-	if rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandValid {
-		arg.LastLogIndex, arg.LastLogTerm = int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandTerm)
-	} else {
+	if rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotValid {
 		arg.LastLogIndex, arg.LastLogTerm = int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].SnapshotTerm)
+	} else {
+		arg.LastLogIndex, arg.LastLogTerm = int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandIndex), int32(rf.commandLog.Msgs[len(rf.commandLog.Msgs)-1].CommandTerm)
 	}
 
-	if len(rf.commandLog.Msgs) > 1 {
+	// if len(rf.commandLog.Msgs) > 1 {
+	// 	arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandIndex
+	// 	arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandTerm
+	// } else {
+	// 	if rf.commandLog.Msgs[0].SnapshotValid {
+	// 		arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[0].SnapshotIndex
+	// 		arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[0].SnapshotTerm
+	// 	} else {
+	// 		arg.Msg[0].LastTimeIndex = 0
+	// 		arg.Msg[0].LastTimeTerm = -1
+	// 	}
+	// }
+	if len(rf.commandLog.Msgs) == 2 && rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].SnapshotValid {
+		arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[0].SnapshotIndex
+		arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[0].SnapshotTerm
+	} else {
 		arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandIndex
 		arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[len(rf.commandLog.Msgs)-2].CommandTerm
-	} else {
-		if rf.commandLog.Msgs[0].SnapshotValid {
-			arg.Msg[0].LastTimeIndex = rf.commandLog.Msgs[0].SnapshotIndex
-			arg.Msg[0].LastTimeTerm = rf.commandLog.Msgs[0].SnapshotTerm
-		} else {
-			arg.Msg[0].LastTimeIndex = 0
-			arg.Msg[0].LastTimeTerm = -1
-		}
 	}
 
 	for i := range rf.raftPeers {
@@ -1157,11 +1210,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return i, m, l
 }
 
-func (r *Raft) getLog(index int) []*LogData {
-
+func (r *Raft) getLogs(index int) []*LogData {
+	defer r.checkFuncDone("getLogs")()
+	termNow := r.getTerm()
 	r.commandLog.MsgRwMu.RLock()
 	defer r.commandLog.MsgRwMu.RUnlock()
-	termNow := r.getTerm()
 	targetLogIndexEnd := r.GetTargetCacheIndex(index)
 	if targetLogIndexEnd < 0 {
 		// panic("Request target index < 0 ")
@@ -1182,12 +1235,10 @@ func (r *Raft) getLog(index int) []*LogData {
 			SelfTermNow: int(termNow),
 			Msg:         r.commandLog.Msgs[targetLogIndexBegin],
 			SelfIndex:   r.me})
-		if r.commandLog.Msgs[targetLogIndexBegin-1].CommandValid {
-			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm =
-				r.commandLog.Msgs[targetLogIndexBegin-1].CommandIndex, r.commandLog.Msgs[targetLogIndexBegin-1].CommandTerm
-		} else if r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotValid {
-			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm =
-				r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotIndex, r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotTerm
+		if r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotValid {
+			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm = r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotIndex, r.commandLog.Msgs[targetLogIndexBegin-1].SnapshotTerm
+		} else if r.commandLog.Msgs[targetLogIndexBegin-1].CommandValid {
+			result[len(result)-1].LastTimeIndex, result[len(result)-1].LastTimeTerm = r.commandLog.Msgs[targetLogIndexBegin-1].CommandIndex, r.commandLog.Msgs[targetLogIndexBegin-1].CommandTerm
 		}
 		targetLogIndexBegin++
 	}
@@ -1200,6 +1251,7 @@ func (r *Raft) tryleaderUpdatePeer(index int, msg *LogData) {
 	}
 }
 func (r *Raft) leaderUpdatePeer(index int, msg *LogData) {
+	defer r.checkFuncDone("leaderUpdatePeer")()
 	defer r.raftPeers[index].modeLock.Unlock()
 	r.dolog(index, "leaderUpdate: leaderUpdatePeer Get RQ")
 	arg := RequestArgs{
@@ -1214,7 +1266,7 @@ func (r *Raft) leaderUpdatePeer(index int, msg *LogData) {
 			break
 		}
 
-		arg.Msg = r.getLog(msg.LastTimeIndex)
+		arg.Msg = r.getLogs(msg.LastTimeIndex)
 		arg.CommitIndex = r.getCommitIndex()
 		rpl := RequestReply{}
 		r.dolog(index, "leaderUpdate: HeartBeat(Update) Go ", arg.string())
@@ -1313,6 +1365,7 @@ func (rf *Raft) ticker() {
 }
 
 func TryToBecomeLeader(rf *Raft) {
+	defer rf.checkFuncDone("TryToBecomeLeader")()
 	rf.changeToCandidate()
 	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me)}
 
@@ -1425,36 +1478,7 @@ func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestRe
 	}
 	return i
 }
-//    type Raft struct {
-//        mu        sync.Mutex          // Lock to protect shared access to this peer's state
-//        peers     []*labrpc.ClientEnd // RPC end points of all peers
-//        persister *Persister          // Object to hold this peer's persisted state
-//        me        int                 // this peer's index into peers[]
-//        dead      int32               // set by Kill()
-//    
-//        isLeaderAlive int32 //
-//        level         int32 //
-//    
-//        commitIndex      int32      //
-//        commitIndexMutex sync.Mutex //
-//    
-//        term            int32 //
-//        termLock        sync.Locker
-//        timeOutChan     chan struct{}
-//        levelChangeChan chan struct{}
-//        raftPeers       []RaftPeer
-//        // Your data here (2A, 2B, 2C).
-//        commandLog Log
-//        // Look at the paper's Figure 2 for a description of what
-//        // state a Raft server must maintain.
-//        commitChan          chan int32
-//        pMsgStore           *MsgStore // nil
-//        pMsgStoreCreateLock sync.Mutex
-//    
-//        KilledChan chan bool
-//    
-//        debugLoger *log.Logger
-//    }
+
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	os.Stderr.WriteString("Raft Make \n")
 	rf := &Raft{}
@@ -1507,7 +1531,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.committer(applyCh)
 	return rf
 }
- 
+
 type peersLogSlice []peersLog
 type peersLog struct {
 	term  int32
@@ -1589,20 +1613,43 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 					rf.commandLog.MsgRwMu.RLock()
 					defer rf.commandLog.MsgRwMu.RUnlock()
 					for exceptLogMsgIndex := LogedIndex + 1; exceptLogMsgIndex <= ToLogIndex; exceptLogMsgIndex++ {
+						rf.debugLoger.Println("1")
+
 						// get cache index
 						expectedLogMsgCacheIndex := int32(rf.GetTargetCacheIndex(int(exceptLogMsgIndex)))
+						rf.debugLoger.Println("2")
+						if expectedLogMsgCacheIndex <= 0 {
+							i := rf.getSnapshotUnsafe()
+							if i.SnapshotValid && i.SnapshotIndex >= int(exceptLogMsgIndex) {
+								exceptLogMsgIndex = int32(i.SnapshotIndex)
+								expectedLogMsgCacheIndex = 0
+							}
+						}
+
 						// out of range
-						if expectedLogMsgCacheIndex <= 0 || expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
+						if expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
 							return false, expectedLogMsgCacheIndex, exceptLogMsgIndex
 						} else {
+							rf.debugLoger.Println("3")
 							// commit operation
-							applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]
+
+							select {
+							case applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]:
+							// 阻塞占有锁 不呢超过10ms
+							case <-time.After(10 * time.Millisecond):
+								goto done
+							}
 
 							rf.dolog(-1, fmt.Sprintf("Committer: Commit log message CacheIndex:[%d] Index[%d] %s", expectedLogMsgCacheIndex, exceptLogMsgIndex, rf.commandLog.Msgs[expectedLogMsgCacheIndex].string()))
+							rf.debugLoger.Println("4")
+
 							LogedIndex = exceptLogMsgIndex
 							rf.justSetCommitIndex(LogedIndex)
+							rf.debugLoger.Println("5")
+
 						}
 					}
+				done:
 					return true, -1, -1
 				}()
 			if !findLogSuccess {
