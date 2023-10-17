@@ -5,15 +5,44 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
+	"sync/atomic"
+	"time"
 
 	"6.5840/labrpc"
 )
+
+func (c *Clerk) checkFuncDone(FuncName string) func() {
+	t := time.Now().UnixNano()
+	i := make(chan bool, 1)
+	i2 := make(chan bool, 1)
+	go func() {
+		c.Logger.Print("\t", t, "\t", FuncName+" GO\n")
+		i2 <- true
+		for {
+			select {
+			case <-time.After(1 * time.Second):
+				c.Logger.Print("\t", t, "\t", "!!!!\t", FuncName+" MayLocked\n")
+			case <-i:
+				close(i)
+				return
+			}
+		}
+	}()
+	<-i2
+	close(i2)
+	return func() {
+		i <- true
+		c.Logger.Print("\t", t, "\t", FuncName+" return\n")
+	}
+}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	ID                int64
-	usefulServerIndex int
+	usefulServerIndex int64
+	Logger            *log.Logger
 }
 
 func nrand() int64 {
@@ -28,6 +57,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.ID = nrand()
+	file2, err := os.OpenFile(fmt.Sprintf("/home/wang/raftLog/Client_%d.R", os.Getpid()), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("err.Error(): %v\n", err.Error()))
+		log.Fatal(err)
+	}
+	ck.Logger = log.New(file2, "", log.LstdFlags)
+	ck.Logger.SetFlags(log.Lmicroseconds)
 	return ck
 }
 
@@ -42,16 +78,19 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
+	defer ck.checkFuncDone("Get")()
 	args := GetArgs{Key: key}
 	rpl := GetReply{}
-	for ok := true; ok; {
-		index := nrand() % int64(len(ck.servers))
-		ok = ck.servers[index].Call("KVServer.Get", &args, &rpl)
+	var ServerIndex int64
+	for ok, ServerIndex := false, atomic.LoadInt64(&ck.usefulServerIndex); !ok; ServerIndex = (ServerIndex + 1) % int64(len(ck.servers)) {
+		ck.Logger.Printf("Client(%d)--S[%d] Call Get K[%s]", ck.ID, ServerIndex, key)
+		ok = ck.servers[ServerIndex].Call("KVServer.Get", &args, &rpl)
 	}
 	if len(rpl.Err) != 0 {
-		log.Printf("Client Get Key(%s) failed Because of error: %v\n", key, rpl.Err)
+		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) failed Because of error: %v\n", ck.ID, ServerIndex, key, rpl.Err)
 		return ""
 	} else {
+		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) - Value(%s)\n", ck.ID, ServerIndex, key, rpl.Value)
 		return rpl.Value
 	}
 }
@@ -65,12 +104,21 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{Key: key, Value: value, Op: op, ArgsId: fmt.Sprintf("%d", nrand())}
-	rpl := GetReply{}
-	for ; ; ck.usefulServerIndex = (ck.usefulServerIndex + 1) % len(ck.servers) {
-		ck.servers[ck.usefulServerIndex].Call("KVServer.PutAppend", &args, &rpl)
-		if len(rpl.Err) == 0 {
-			break
+	defer ck.checkFuncDone("PutAppend")()
+	ck.Logger.Printf("Client(%d) Call %s K[%s]", ck.ID, op, key)
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ArgsId: nrand(), Time: time.Now().UnixMilli()}
+	for ; ; atomic.StoreInt64(&ck.usefulServerIndex, (atomic.LoadInt64(&ck.usefulServerIndex)+1)%int64(len(ck.servers))) {
+		rpl := PutAppendReply{}
+		if ok := ck.servers[ck.usefulServerIndex].Call("KVServer.PutAppend", &args, &rpl); !ok {
+			ck.Logger.Printf("Client(%d)--Server(%d) Call %s Call False ", ck.ID, ck.usefulServerIndex, op)
+			continue
+		}
+		if len(rpl.Err) != 0 {
+			ck.Logger.Printf("Client(%d)--Server[%d] %s[Err:%s] K(%s)-V(%s)\n", ck.ID, ck.usefulServerIndex, op, rpl.Err, key, value)
+			time.Sleep(25 * time.Millisecond)
+		} else {
+			ck.Logger.Printf("Client(%d)--Server[%d] %s K(%s)-V(%s)\n", ck.ID, ck.usefulServerIndex, op, key, value)
+			return
 		}
 	}
 }

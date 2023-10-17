@@ -46,11 +46,13 @@ func (r *Raft) checkFuncDone(FuncName string) func() {
 			case <-time.After(rpcTimeOut * 2 * time.Millisecond):
 				r.Dolog(-1, "\n", t, "!!!!\t", FuncName+" MayLocked\n")
 			case <-i:
+				close(i)
 				return
 			}
 		}
 	}()
 	<-i2
+	close(i2)
 	return func() {
 		i <- true
 		r.Dolog(-1, t, FuncName+" return")
@@ -169,12 +171,12 @@ type Log struct {
 
 // A Go object implementing a single Raft peer.
 type RaftPeer struct {
-	C              *labrpc.ClientEnd
-	modeLock       sync.Mutex
-	BeginHeartBeat chan struct{}
-	StopHeartBeat  chan struct{}
-	JumpHeartBeat  chan struct{}
-
+	C                *labrpc.ClientEnd
+	modeLock         sync.Mutex
+	BeginHeartBeat   chan struct{}
+	StopHeartBeat    chan struct{}
+	JumpHeartBeat    chan struct{}
+	SendHeartBeat    chan struct{}
 	logIndexTermLock sync.Mutex
 	logIndex         int32
 	lastLogTerm      int32
@@ -343,45 +345,46 @@ func (r *Raft) registeHeartBeat(index int) {
 			case <-r.raftPeers[index].StopHeartBeat:
 				goto restart
 			case <-r.raftPeers[index].JumpHeartBeat:
-
+				continue
 			case <-time.After(HeartbeatTimeout):
-				if r.getLevel() != LevelLeader {
-					goto restart
-				}
-				arg.LastLogIndex, arg.LastLogTerm = r.getLastLogData()
-				arg.SelfTerm = r.getTerm()
-				arg.Time = time.Now()
-				arg.CommitIndex = r.getCommitIndex()
-				arg.Msg = nil
-				// do call
-				ok := r.call(index, "Raft.HeartBeat", &arg, &rpl)
-				if !ok {
-					continue
-				}
-				if ok && !rpl.IsAgree && (rpl.PeerSelfTerm > r.getTerm() || rpl.PeerLastLogIndex > r.getLogIndex() || rpl.PeerLastLogTerm > arg.LastLogTerm) {
+			case <-r.raftPeers[index].SendHeartBeat:
+			}
+			if r.getLevel() != LevelLeader {
+				goto restart
+			}
+			arg.LastLogIndex, arg.LastLogTerm = r.getLastLogData()
+			arg.SelfTerm = r.getTerm()
+			arg.Time = time.Now()
+			arg.CommitIndex = r.getCommitIndex()
+			arg.Msg = nil
+			// do call
+			ok := r.call(index, "Raft.HeartBeat", &arg, &rpl)
+			if !ok {
+				continue
+			}
+			if ok && !rpl.IsAgree && (rpl.PeerSelfTerm > r.getTerm() || rpl.PeerLastLogIndex > r.getLogIndex() || rpl.PeerLastLogTerm > arg.LastLogTerm) {
 
-					r.commandLog.MsgRwMu.RLock()
-					r.DebugLoger.Println("\nHeartBeat Error:\n " + showMsgS(r.commandLog.Msgs))
-					r.commandLog.MsgRwMu.RUnlock()
+				r.commandLog.MsgRwMu.RLock()
+				r.DebugLoger.Println("\nHeartBeat Error:\n " + showMsgS(r.commandLog.Msgs))
+				r.commandLog.MsgRwMu.RUnlock()
 
-					r.Dolog(index, "r.HeartBeatErrr", r.getLogIndex(), "heartbeat return false Going to be Follower", arg.string(), rpl.string())
-					r.changeToFollower(&rpl)
-				} else {
-					// atomic.StoreInt32(&r.raftPeers[index].logIndex, rpl.PeerLastLogIndex)
-					// atomic.StoreInt32(&r.raftPeers[index].lastLogTerm, rpl.PeerLastLogTerm)
-					func() {
-						r.raftPeers[index].logIndexTermLock.Lock()
-						defer r.raftPeers[index].logIndexTermLock.Unlock()
-						if rpl.PeerLastLogTerm > r.raftPeers[index].lastLogTerm {
-							r.raftPeers[index].lastLogTerm = rpl.PeerLastLogTerm
-							r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
-						} else if rpl.PeerLastLogTerm == r.raftPeers[index].lastLogTerm {
-							r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
-						}
-					}()
-					if rpl.PeerLastLogIndex < arg.LastLogIndex || rpl.PeerLastLogTerm < arg.LastLogTerm {
-						r.tryleaderUpdatePeer(index, &LogData{Msg: nil, LastTimeIndex: int(arg.LastLogIndex), LastTimeTerm: int(arg.LastLogTerm)})
+				r.Dolog(index, "r.HeartBeatErrr", r.getLogIndex(), "heartbeat return false Going to be Follower", arg.string(), rpl.string())
+				r.changeToFollower(&rpl)
+			} else {
+				// atomic.StoreInt32(&r.raftPeers[index].logIndex, rpl.PeerLastLogIndex)
+				// atomic.StoreInt32(&r.raftPeers[index].lastLogTerm, rpl.PeerLastLogTerm)
+				func() {
+					r.raftPeers[index].logIndexTermLock.Lock()
+					defer r.raftPeers[index].logIndexTermLock.Unlock()
+					if rpl.PeerLastLogTerm > r.raftPeers[index].lastLogTerm {
+						r.raftPeers[index].lastLogTerm = rpl.PeerLastLogTerm
+						r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
+					} else if rpl.PeerLastLogTerm == r.raftPeers[index].lastLogTerm {
+						r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
 					}
+				}()
+				if rpl.PeerLastLogIndex < arg.LastLogIndex || rpl.PeerLastLogTerm < arg.LastLogTerm {
+					r.tryleaderUpdatePeer(index, &LogData{Msg: nil, LastTimeIndex: int(arg.LastLogIndex), LastTimeTerm: int(arg.LastLogTerm)})
 				}
 			}
 		}
@@ -674,7 +677,7 @@ func (rf *Raft) SnapshotUnsafe(index int, InputSnapShotTerm int, snapshot []byte
 			rf.commandLog.Msgs = append(make([]*ApplyMsg, 0), newMagsHead)
 		}
 	}
-	go func(){
+	go func() {
 		rf.applyChan <- *newMagsHead
 	}()
 	rf.persistUnsafe(rf.commandLog.Msgs[0])
@@ -1523,7 +1526,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
 	for i := range rf.peers {
-		rf.raftPeers[i] = RaftPeer{C: rf.peers[i], JumpHeartBeat: make(chan struct{}, 1), BeginHeartBeat: make(chan struct{}), StopHeartBeat: make(chan struct{})}
+		rf.raftPeers[i] = RaftPeer{C: rf.peers[i], SendHeartBeat: make(chan struct{}), JumpHeartBeat: make(chan struct{}, 1), BeginHeartBeat: make(chan struct{}), StopHeartBeat: make(chan struct{})}
 		rf.raftPeers[i].modeLock = sync.Mutex{}
 		if i != rf.me {
 			go rf.registeHeartBeat(i)
@@ -1558,7 +1561,16 @@ func (s peersLogSlice) Less(i, j int) bool {
 func (s peersLogSlice) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
-
+func (rf *Raft) sendHeartBeat() {
+	for i := range rf.raftPeers {
+		if i != rf.me {
+			select {
+			case rf.raftPeers[i].SendHeartBeat <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
 func (rf *Raft) committer(applyCh chan ApplyMsg) {
 	rf.Dolog(-1, "Committer Create \n")
 	var ToLogIndex int32
@@ -1574,7 +1586,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 		// leader scan followers to deside New TologIndex
 		case <-rf.KilledChan:
 			return
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(25 * time.Millisecond):
 			if rf.getLevel() == LevelLeader {
 				for i := range rf.raftPeers {
 					rf.raftPeers[i].logIndexTermLock.Lock()
@@ -1592,6 +1604,8 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 					ToLogIndex = ToLogHalfIndex.index
 					// atomic.StoreInt32(&rf.commitIndex, ToLogIndex)
 					rf.Dolog(-1, "Committer: Update CommitIndex", ToLogIndex)
+					rf.justSetCommitIndex(ToLogIndex)
+					rf.sendHeartBeat()
 				}
 			}
 
@@ -1613,50 +1627,56 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 			ToLogIndex = LogedIndex
 			continue
 		} else {
-			findLogSuccess, expectedLogMsgCacheIndex, exceptLogMsgIndex :=
-				func() (bool, int32, int32) {
-					rf.commandLog.MsgRwMu.RLock()
-					defer rf.commandLog.MsgRwMu.RUnlock()
-					for exceptLogMsgIndex := LogedIndex + 1; exceptLogMsgIndex <= ToLogIndex; exceptLogMsgIndex++ {
-						rf.DebugLoger.Println("1")
+			findLogSuccess := false
+			expectedLogMsgCacheIndex, exceptLogMsgIndex := int32(0), int32(0)
+			for {
+				findLogSuccess, expectedLogMsgCacheIndex, exceptLogMsgIndex =
+					func() (bool, int32, int32) {
+						rf.commandLog.MsgRwMu.RLock()
+						defer rf.commandLog.MsgRwMu.RUnlock()
+						for exceptLogMsgIndex := LogedIndex + 1; exceptLogMsgIndex <= ToLogIndex; exceptLogMsgIndex++ {
+							rf.DebugLoger.Println("1")
 
-						// get cache index
-						expectedLogMsgCacheIndex := int32(rf.GetTargetCacheIndex(int(exceptLogMsgIndex)))
-						rf.DebugLoger.Println("2")
-						if expectedLogMsgCacheIndex <= 0 {
-							i := rf.getSnapshotUnsafe()
-							if i.SnapshotValid && i.SnapshotIndex >= int(exceptLogMsgIndex) {
-								exceptLogMsgIndex = int32(i.SnapshotIndex)
-								expectedLogMsgCacheIndex = 0
-							}
-						}
-
-						// out of range
-						if expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
-							return false, expectedLogMsgCacheIndex, exceptLogMsgIndex
-						} else {
-							rf.DebugLoger.Println("3")
-							// commit operation
-
-							select {
-							case applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]:
-							// 阻塞占有锁 不呢超过10ms
-							case <-time.After(10 * time.Millisecond):
-								goto done
+							// get cache index
+							expectedLogMsgCacheIndex := int32(rf.GetTargetCacheIndex(int(exceptLogMsgIndex)))
+							rf.DebugLoger.Println("2")
+							if expectedLogMsgCacheIndex <= 0 {
+								i := rf.getSnapshotUnsafe()
+								if i.SnapshotValid && i.SnapshotIndex >= int(exceptLogMsgIndex) {
+									exceptLogMsgIndex = int32(i.SnapshotIndex)
+									expectedLogMsgCacheIndex = 0
+								}
 							}
 
-							rf.Dolog(-1, fmt.Sprintf("Committer: Commit log message CacheIndex:[%d] Index[%d] %s", expectedLogMsgCacheIndex, exceptLogMsgIndex, rf.commandLog.Msgs[expectedLogMsgCacheIndex].string()))
-							rf.DebugLoger.Println("4")
+							// out of range
+							if expectedLogMsgCacheIndex >= int32(len(rf.commandLog.Msgs)) {
+								return false, expectedLogMsgCacheIndex, exceptLogMsgIndex
+							} else {
+								rf.DebugLoger.Println("3")
+								// commit operation
 
-							LogedIndex = exceptLogMsgIndex
-							rf.justSetCommitIndex(LogedIndex)
-							rf.DebugLoger.Println("5")
+								select {
+								case applyCh <- *rf.commandLog.Msgs[expectedLogMsgCacheIndex]:
+								// 阻塞占有锁 不呢超过10ms
+								case <-time.After(10 * time.Millisecond):
+									goto done
+								}
 
+								rf.Dolog(-1, fmt.Sprintf("Committer: Commit log message CacheIndex:[%d] Index[%d] %s", expectedLogMsgCacheIndex, exceptLogMsgIndex, rf.commandLog.Msgs[expectedLogMsgCacheIndex].string()))
+								rf.DebugLoger.Println("4")
+
+								LogedIndex = exceptLogMsgIndex
+								rf.DebugLoger.Println("5")
+
+							}
 						}
-					}
-				done:
-					return true, -1, -1
-				}()
+					done:
+						return true, -1, -1
+					}()
+				if !findLogSuccess || LogedIndex == ToLogIndex {
+					break
+				}
+			}
 			if !findLogSuccess {
 				//log
 				rf.Dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
