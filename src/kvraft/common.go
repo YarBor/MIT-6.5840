@@ -17,7 +17,7 @@ type PutAppendArgs struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	ArgsId int64
-	Time   int64 
+	SelfID   int64 
 
 }
 
@@ -31,6 +31,6 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	Err   Err
 	Value string
+	Err   Err
 }

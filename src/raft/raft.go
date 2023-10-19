@@ -76,7 +76,7 @@ const (
 	LogCheckReLoad       = 4
 	LogCheckSnap         = 5
 
-	UpdateLogLines = 500
+	UpdateLogLines = 200
 
 	LogStateNormal = int32(0)
 	LogUpdateIng   = int32(1)
@@ -261,7 +261,7 @@ func (r *Raft) setCommitIndex(i int32) {
 
 func (r *Raft) setCommitIndexUnsafe(i int32) {
 	r.commitIndex = i
-	r.persist(r.getSnapshot())
+	// r.registPersist()
 }
 func (r *Raft) getSnapshot() *ApplyMsg {
 	r.commandLog.MsgRwMu.RLock()
@@ -306,7 +306,7 @@ func (r *Raft) setTerm(i int32) {
 }
 func (r *Raft) setTermUnsafe(i int32) {
 	r.term = i
-	r.persist(r.getSnapshot())
+	// r.registPersist()
 }
 func (r *Raft) beginSendHeartBeat() {
 	for i := range r.raftPeers {
@@ -446,7 +446,9 @@ func (r *Raft) changeToFollower(rpl *RequestReply) {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 func (r *Raft) HeartBeat(arg *RequestArgs, rpl *RequestReply) {
-
+	if r.killed() {
+		return
+	}
 	defer func(tmpArg *RequestArgs, tmpRpl *RequestReply) {
 		r.Dolog(int(tmpArg.SelfIndex), "REPLY Heartbeat", "\t\n Arg:", tmpArg.string(), "\t\n Rpl:", tmpRpl.string())
 	}(arg, rpl)
@@ -506,6 +508,12 @@ func (rf *Raft) persist(snapshot *ApplyMsg) {
 	defer rf.commandLog.MsgRwMu.Unlock()
 	rf.persistUnsafe(snapshot)
 
+}
+
+type CommandPersistNode struct {
+	Term    int64
+	Command interface{}
+	Index   int64
 }
 
 // 此函数不保证对log的操作的原子性
@@ -705,6 +713,9 @@ func (r *RequestReply) string() string {
 }
 
 func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
+	if r.killed() {
+		return
+	}
 	defer r.checkFuncDone("RequestPreVote")()
 	reply.PeerLastLogIndex, reply.PeerLastLogTerm = r.getLastLogData()
 	reply.PeerSelfTerm = r.getTerm()
@@ -714,6 +725,9 @@ func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
 }
 
 func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
+	if rf.killed() {
+		return
+	}
 	defer rf.checkFuncDone("RequestVote")()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -1001,7 +1015,6 @@ func (rf *Raft) saveMsg() (*LogData, bool) {
 						rf.commandLog.Msgs = rf.commandLog.Msgs[:index+2]
 					}
 				}
-				// rf.persistUnsafe(rf.getSnapshotUnsafe())
 				IsChangeMsg = true
 			} else {
 				break
@@ -1101,7 +1114,7 @@ func (rf *Raft) updateMsgs(msg []*LogData) *LogData {
 		rf.DebugLoger.Printf("Pmsg:> \n%s", rf.pMsgStore.string())
 	}
 	if IsChangeMsg || IsSave {
-		rf.persistUnsafe(rf.getSnapshotUnsafe())
+		// rf.registPersist()
 	}
 	// if i != nil {
 	// 	log.Printf("Return rpl To request msg : %+v\n \nMsg Now:>\n", i.string())
@@ -1125,8 +1138,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
 
-	if LevelNow != LevelLeader {
-		i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), false
+	if LevelNow != LevelLeader || command == nil {
+		i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), LevelNow == LevelLeader
 		rf.Dolog(-1, "Start return ", "LogIndex", i, "Term", m, "Level", l)
 		return i, m, l
 	}
@@ -1145,7 +1158,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.raftPeers[rf.me].logIndexTermLock.Unlock()
 
 	rf.Dolog(-1, "Start TO LogAppend", newMessage.string())
-	rf.persistUnsafe(rf.getSnapshotUnsafe())
+	// rf.registPersist()
 
 	arg = &RequestArgs{
 		SelfTerm:  TermNow,
@@ -1217,7 +1230,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return i, m, l
 }
 
-func (r *Raft) getLogs(index int) []*LogData {
+func (r *Raft) getLogs(index int, Len int) []*LogData {
 	defer r.checkFuncDone("getLogs")()
 	termNow := r.getTerm()
 	r.commandLog.MsgRwMu.RLock()
@@ -1229,7 +1242,7 @@ func (r *Raft) getLogs(index int) []*LogData {
 	} else if targetLogIndexEnd >= len(r.commandLog.Msgs) {
 		panic("Request target index out of range ")
 	}
-	targetLogIndexBegin := targetLogIndexEnd - UpdateLogLines
+	targetLogIndexBegin := targetLogIndexEnd - Len
 	result := make([]*LogData, 0)
 	if targetLogIndexBegin <= 0 {
 		if r.commandLog.Msgs[0].SnapshotValid {
@@ -1257,10 +1270,21 @@ func (r *Raft) tryleaderUpdatePeer(index int, msg *LogData) {
 		go r.leaderUpdatePeer(index, msg)
 	}
 }
-func (r *Raft) leaderUpdatePeer(index int, msg *LogData) {
+func (rf *Raft) isInLog(index int, Term int) bool {
+	rf.commandLog.MsgRwMu.RLock()
+	defer rf.commandLog.MsgRwMu.RUnlock()
+	i := rf.GetTargetCacheIndex(index)
+	if i < 0 || i >= len(rf.commandLog.Msgs) {
+		return false
+	} else if (rf.commandLog.Msgs[i].SnapshotValid && rf.commandLog.Msgs[i].SnapshotTerm == Term) || (rf.commandLog.Msgs[i].CommandValid && rf.commandLog.Msgs[i].CommandTerm == Term) {
+		return true
+	}
+	return false
+}
+func (r *Raft) leaderUpdatePeer(peerIndex int, msg *LogData) {
 	defer r.checkFuncDone("leaderUpdatePeer")()
-	defer r.raftPeers[index].modeLock.Unlock()
-	r.Dolog(index, "leaderUpdate: leaderUpdatePeer Get RQ")
+	defer r.raftPeers[peerIndex].modeLock.Unlock()
+	r.Dolog(peerIndex, "leaderUpdate: leaderUpdatePeer Get RQ")
 	arg := RequestArgs{
 		SelfTerm:  r.getTerm(),
 		SelfIndex: int32(r.me),
@@ -1272,37 +1296,44 @@ func (r *Raft) leaderUpdatePeer(index int, msg *LogData) {
 		if r.getLevel() != LevelLeader {
 			break
 		}
-
-		arg.Msg = r.getLogs(msg.LastTimeIndex)
+		r.raftPeers[peerIndex].logIndexTermLock.Lock()
+		peerLastLogIndex, peerLastLogTerm := r.raftPeers[peerIndex].logIndex, r.raftPeers[peerIndex].lastLogTerm
+		r.raftPeers[peerIndex].logIndexTermLock.Unlock()
+		if ok := r.isInLog(int(peerLastLogIndex), int(peerLastLogTerm)); ok {
+			getLen := msg.LastTimeIndex - int(peerLastLogIndex)
+			arg.Msg = r.getLogs(msg.LastTimeIndex, getLen)
+		} else {
+			arg.Msg = r.getLogs(msg.LastTimeIndex, UpdateLogLines)
+		}
 		arg.CommitIndex = r.getCommitIndex()
 		rpl := RequestReply{}
-		r.Dolog(index, "leaderUpdate: HeartBeat(Update) Go ", arg.string())
+		r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) Go ", arg.string())
 
 		select {
-		case r.raftPeers[index].JumpHeartBeat <- struct{}{}:
+		case r.raftPeers[peerIndex].JumpHeartBeat <- struct{}{}:
 		default:
 		}
 
 		// 没有超时机制
-		ok := r.raftPeers[index].C.Call("Raft.HeartBeat", &arg, &rpl)
+		ok := r.raftPeers[peerIndex].C.Call("Raft.HeartBeat", &arg, &rpl)
 
-		r.Dolog(index, "leaderUpdate: HeartBeat(Update) return ", rpl.string())
+		r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) return ", rpl.string())
 
 		if !ok {
-			r.Dolog(index, "leaderUpdate: HeartBeat(Update) Timeout CallFalse", arg.string())
+			r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) Timeout CallFalse", arg.string())
 			break
 		} else if !rpl.IsAgree {
-			r.Dolog(index, "leaderUpdate: HeartBeat(Update) DisAgree", rpl.string())
+			r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) DisAgree", rpl.string())
 			break
 		} else if rpl.LogDataMsg != nil {
-			r.Dolog(index, "leaderUpdate: HeartBeat(Update) ReWriteCacheToGetNextOne", rpl.string())
+			r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) ReWriteCacheToGetNextOne", rpl.string())
 			msg = rpl.LogDataMsg
 		} else {
-			r.Dolog(index, "leaderUpdate: HeartBeat(Update) UpdateDone", rpl.string())
+			r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) UpdateDone", rpl.string())
 			break
 		}
 	}
-	r.Dolog(index, "leaderUpdate: Update Done")
+	r.Dolog(peerIndex, "leaderUpdate: Update Done")
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -1536,6 +1567,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	// go rf.persisterTicker()
 	go rf.committer(applyCh)
 	return rf
 }
@@ -1586,7 +1618,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 		// leader scan followers to deside New TologIndex
 		case <-rf.KilledChan:
 			return
-		case <-time.After(25 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 			if rf.getLevel() == LevelLeader {
 				for i := range rf.raftPeers {
 					rf.raftPeers[i].logIndexTermLock.Lock()
@@ -1627,6 +1659,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 			ToLogIndex = LogedIndex
 			continue
 		} else {
+			rf.persist(rf.getSnapshot())
 			findLogSuccess := false
 			expectedLogMsgCacheIndex, exceptLogMsgIndex := int32(0), int32(0)
 			for {
@@ -1682,7 +1715,6 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 				rf.Dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
 				continue
 			}
-			rf.setCommitIndex(LogedIndex)
 		}
 	}
 }

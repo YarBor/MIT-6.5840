@@ -57,7 +57,10 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
-
+type node struct {
+	ArgsId int64
+	SelfID int64
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -71,7 +74,7 @@ type KVServer struct {
 	DataRWLock     sync.RWMutex
 	Data           map[string]string
 	RequestMapLock sync.Mutex
-	RequestMap     map[PutAppendArgs]chan bool
+	RequestMap     map[node]chan bool
 
 	DebugLoger *log.Logger
 	CheckCache *cache
@@ -84,33 +87,44 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = "Server killed"
 		return
 	}
-	kv.DataRWLock.RLock()
-	V, ok := kv.Data[args.Key]
-	kv.DataRWLock.RUnlock()
-	if ok {
-		reply.Value = V
+	if _, _, ok := kv.rf.Start(nil); !ok {
+		reply.Err = "Not Leader"
 	} else {
-		reply.Err = "K/V not found"
+		kv.DataRWLock.RLock()
+		V, ok := kv.Data[args.Key]
+		kv.DataRWLock.RUnlock()
+		if ok {
+			reply.Value = V
+		} else {
+		}
 	}
 	kv.Dolog(*reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+
 	defer kv.checkFuncDone("PutAppend")()
 	// Your code here.
 	if kv.killed() {
 		reply.Err = "Server killed"
 		return
 	}
+	if _, _, ok := kv.rf.Start(nil); !ok {
+		kv.Dolog("Get PutAppend Request", *args, "No Leader")
+		reply.Err = "This server is not leader"
+		return
+	}
 	var IsLoadChan chan bool
-	if Isdone, _ := kv.CheckCache.check(args); Isdone {
+	if Isdone := kv.CheckCache.check(args); Isdone {
 		kv.Dolog("get req PutAppend", *args, "But already loaded return ")
 		return
 	}
+	n := node{ArgsId: args.ArgsId, SelfID: args.SelfID}
 	if _, _, ok := kv.rf.Start(*args); ok {
 		IsLoadChan = make(chan bool, 1)
 		kv.RequestMapLock.Lock()
-		kv.RequestMap[*args] = IsLoadChan
+
+		kv.RequestMap[n] = IsLoadChan
 		kv.RequestMapLock.Unlock()
 	} else {
 		kv.Dolog("Get PutAppend Request", *args, "No Leader")
@@ -118,13 +132,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	select {
-	case <-time.NewTimer(100 * time.Millisecond).C:
+	case <-time.NewTimer(50 * time.Millisecond).C:
 		kv.RequestMapLock.Lock()
-		delete(kv.RequestMap, *args)
-		close(IsLoadChan)
+		IsLoadChan, ok := kv.RequestMap[n]
+		if ok {
+			delete(kv.RequestMap, n)
+			close(IsLoadChan)
+			reply.Err = "Timeout"
+			kv.Dolog("Timeout", *args)
+		}
 		kv.RequestMapLock.Unlock()
-		reply.Err = "Timeout"
-		kv.Dolog("Timeout", *args)
 	case <-IsLoadChan:
 		reply.Err = ""
 		kv.Dolog("success", *args)
@@ -140,11 +157,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
+	kv.Dolog(" DoKILL ")
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	for i := range kv.CheckCache.sets {
-		kv.CheckCache.sets[i].kill <- struct{}{}
-	}
+	// for i := range kv.CheckCache.sets {
+	// kv.CheckCache.sets[i].kill <- struct{}{}
+	// }
 	// Your code here, if desired.
 }
 
@@ -165,7 +183,6 @@ func (kv *KVServer) killed() bool {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-var CacheLen = 10
 
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
@@ -182,7 +199,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	// You may need initialization code here.
-	kv.RequestMap = make(map[PutAppendArgs]chan bool)
+	kv.RequestMap = make(map[node]chan bool)
 	kv.Data = make(map[string]string)
 
 	file2, err := os.OpenFile(fmt.Sprintf("/home/wang/raftLog/kvServer_%d_%d.R", os.Getpid(), kv.me), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
@@ -192,7 +209,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	}
 	kv.DebugLoger = log.New(file2, "", log.LstdFlags)
 	kv.DebugLoger.SetFlags(log.Lmicroseconds)
-	kv.CheckCache = makeCache(CacheLen)
+	kv.CheckCache = makeCache()
 	go kv.loadData()
 	return kv
 }
@@ -213,29 +230,33 @@ func (kv *KVServer) loadData() {
 			fmt.Printf("reflect.TypeOf(submitCommand.Command): %v\n", reflect.TypeOf(submitCommand.Command))
 			panic("GetCommandFalse")
 		} else {
-			if IsDone, node := kv.CheckCache.check(&Command); IsDone {
+			if IsDone := kv.CheckCache.check(&Command); IsDone {
+				kv.Dolog("get command ", Command, " Has Done Before")
 				continue
 			} else {
-				kv.CheckCache.registe(node)
-			}
-			kv.DataRWLock.Lock()
-			switch Command.Op {
-			case "Put":
-				kv.Data[Command.Key] = Command.Value
-			case "Append":
-				if value, ok := kv.Data[Command.Key]; ok {
-					kv.Data[Command.Key] = value + Command.Value
-				} else {
+				kv.DataRWLock.Lock()
+				kv.Dolog("to do command ", Command)
+				switch Command.Op {
+				case "Put":
 					kv.Data[Command.Key] = Command.Value
+				case "Append":
+					if value, ok := kv.Data[Command.Key]; ok {
+						kv.Data[Command.Key] = value + Command.Value
+					} else {
+						kv.Data[Command.Key] = Command.Value
+					}
 				}
+				kv.DataRWLock.Unlock()
+				kv.CheckCache.registe(&Command)
+				kv.Dolog("Done command ", Command)
 			}
-			kv.DataRWLock.Unlock()
 		}
 		kv.RequestMapLock.Lock()
-		IsloadChan, ok := kv.RequestMap[Command]
+		n := node{ArgsId: Command.ArgsId, SelfID: Command.SelfID}
+		IsloadChan, ok := kv.RequestMap[n]
 		if !ok {
 		} else {
-			delete(kv.RequestMap, Command)
+			delete(kv.RequestMap, n)
 			IsloadChan <- true
 			close(IsloadChan)
 		}
@@ -303,60 +324,36 @@ Server 再一次 拿到 该命令
 var LogDDL = 20 * time.Second
 
 type cache struct {
-	len  int
-	sets []*set
+	data   map[int64]*struct{ commandId int64 }
+	rwlock sync.RWMutex
 }
 
-func makeCache(len int) *cache {
-	C := new(cache)
-	C.len = len
-	C.sets = make([]*set, len)
-	for i := range C.sets {
-		C.sets[i] = makeSet()
-	}
+func makeCache() *cache {
+	C := &cache{data: make(map[int64]*struct{ commandId int64 })}
 	return C
 }
-func (c *cache) check(args *PutAppendArgs) (bool, *checkNode) {
-	node := &checkNode{CID: args.ArgsId, T: args.Time}
-	return c.sets[args.ArgsId%int64(c.len)].check(node), node
-}
-func (c *cache) registe(args *checkNode) {
-	c.sets[args.CID%int64(c.len)].registe(args)
-}
 
-type set struct {
-	val     map[checkNode]struct{}
-	valLock sync.RWMutex
-	kill    chan struct{}
+// 是否重复id
+func (c *cache) check(input *PutAppendArgs) bool {
+	c.rwlock.RLock()
+	i, ok := c.data[input.SelfID]
+	c.rwlock.RUnlock()
+	if ok {
+		return atomic.LoadInt64(&i.commandId) >= input.ArgsId
+	}
+	return false
 }
-
-type checkNode struct {
-	CID int64
-	T   int64
-}
-
-func (s *set) registe(arg *checkNode) {
-	s.valLock.Lock()
-	s.val[*arg] = struct{}{}
-	s.valLock.Unlock()
-	go func() {
-		time.Sleep(LogDDL)
-		s.clean(arg)
-	}()
-}
-func (s *set) check(arg *checkNode) bool {
-	s.valLock.RLock()
-	_, ok := s.val[*arg]
-	s.valLock.RUnlock()
-	return ok
-}
-func (s *set) clean(arg *checkNode) {
-	s.valLock.Lock()
-	delete(s.val, *arg)
-	s.valLock.Unlock()
-}
-func makeSet() *set {
-	s := new(set)
-	s.val = make(map[checkNode]struct{})
-	return s
+func (c *cache) registe(input *PutAppendArgs) {
+	c.rwlock.RLock()
+	i, ok := c.data[input.SelfID]
+	c.rwlock.RUnlock()
+	if !ok {
+		c.rwlock.Lock()
+		c.data[input.SelfID] = &struct{ commandId int64 }{commandId: input.ArgsId}
+		c.rwlock.Unlock()
+		return
+	} else {
+		// atomic.CompareAndSwapInt64(&i.commandId,atomic.LoadInt64(&i.commandId),input.ArgsId)
+		atomic.StoreInt64(&i.commandId, input.ArgsId)
+	}
 }

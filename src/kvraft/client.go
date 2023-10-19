@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +44,8 @@ type Clerk struct {
 	ID                int64
 	usefulServerIndex int64
 	Logger            *log.Logger
+	CommandId         int64
+	Mutex             sync.Mutex
 }
 
 func nrand() int64 {
@@ -54,7 +57,7 @@ func nrand() int64 {
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
-	ck.servers = servers
+	ck.servers = append(make([]*labrpc.ClientEnd, 0), servers...)
 	// You'll have to add code here.
 	ck.ID = nrand()
 	file2, err := os.OpenFile(fmt.Sprintf("/home/wang/raftLog/Client_%d.R", os.Getpid()), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
@@ -80,17 +83,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	defer ck.checkFuncDone("Get")()
 	args := GetArgs{Key: key}
-	rpl := GetReply{}
-	var ServerIndex int64
-	for ok, ServerIndex := false, atomic.LoadInt64(&ck.usefulServerIndex); !ok; ServerIndex = (ServerIndex + 1) % int64(len(ck.servers)) {
-		ck.Logger.Printf("Client(%d)--S[%d] Call Get K[%s]", ck.ID, ServerIndex, key)
-		ok = ck.servers[ServerIndex].Call("KVServer.Get", &args, &rpl)
+	Sindex := atomic.LoadInt64(&ck.usefulServerIndex)
+	i := Sindex
+	var rpl *GetReply
+	for ; ; Sindex = (Sindex + 1) % int64(len(ck.servers)) {
+		rpl = &GetReply{}
+		ck.Logger.Printf("Client(%d)--S[%d] Call Get K[%s]", ck.ID, Sindex, key)
+		if ok := ck.servers[Sindex].Call("KVServer.Get", &args, rpl); ok && rpl.Err == "" {
+			break
+		} else {
+			ck.Logger.Printf("Client(%d)--S[%d] Call false %+v", ck.ID, Sindex, *rpl)
+			// time.Sleep(25 * time.Millisecond)
+		}
+	}
+	if i != Sindex {
+		atomic.StoreInt64(&ck.usefulServerIndex, Sindex)
+		ck.Logger.Printf("'Client(%d)s usefulServerIndex Been Rewritten to [%d]'\n", ck.ID, Sindex)
 	}
 	if len(rpl.Err) != 0 {
-		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) failed Because of error: %v\n", ck.ID, ServerIndex, key, rpl.Err)
+		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) failed Because of error: %v\n", ck.ID, Sindex, key, rpl.Err)
 		return ""
 	} else {
-		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) - Value(%s)\n", ck.ID, ServerIndex, key, rpl.Value)
+		ck.Logger.Printf("Client(%d)--S[%d] Get Key(%s) - Value(%s)\n", ck.ID, Sindex, key, rpl.Value)
 		return rpl.Value
 	}
 }
@@ -104,22 +118,30 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.Mutex.Lock()
+	defer ck.Mutex.Unlock()
 	defer ck.checkFuncDone("PutAppend")()
-	ck.Logger.Printf("Client(%d) Call %s K[%s]", ck.ID, op, key)
-	args := PutAppendArgs{Key: key, Value: value, Op: op, ArgsId: nrand(), Time: time.Now().UnixMilli()}
-	for ; ; atomic.StoreInt64(&ck.usefulServerIndex, (atomic.LoadInt64(&ck.usefulServerIndex)+1)%int64(len(ck.servers))) {
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ArgsId: atomic.AddInt64(&ck.CommandId, 1), SelfID: ck.ID}
+	Sindex := atomic.LoadInt64(&ck.usefulServerIndex)
+	i := Sindex
+	for ; ; Sindex = (Sindex + 1) % int64(len(ck.servers)) {
 		rpl := PutAppendReply{}
-		if ok := ck.servers[ck.usefulServerIndex].Call("KVServer.PutAppend", &args, &rpl); !ok {
-			ck.Logger.Printf("Client(%d)--Server(%d) Call %s Call False ", ck.ID, ck.usefulServerIndex, op)
-			continue
-		}
-		if len(rpl.Err) != 0 {
-			ck.Logger.Printf("Client(%d)--Server[%d] %s[Err:%s] K(%s)-V(%s)\n", ck.ID, ck.usefulServerIndex, op, rpl.Err, key, value)
-			time.Sleep(25 * time.Millisecond)
+		ck.Logger.Printf("Client(%d)--Server(%d) Call %s K[%s]", ck.ID, Sindex, op, key)
+		if ok := ck.servers[Sindex].Call("KVServer.PutAppend", &args, &rpl); ok && len(rpl.Err) == 0 {
+			ck.Logger.Printf("Client(%d)--Server[%d] %s K(%s)-V(%s)\n", ck.ID, Sindex, op, key, value)
+			break
 		} else {
-			ck.Logger.Printf("Client(%d)--Server[%d] %s K(%s)-V(%s)\n", ck.ID, ck.usefulServerIndex, op, key, value)
-			return
+			if !ok {
+				ck.Logger.Printf("Client(%d)--Server(%d) Call %s Call False ", ck.ID, Sindex, op)
+			} else if len(rpl.Err) > 0 {
+				ck.Logger.Printf("Client(%d)--Server[%d] %s[Err:%s] K(%s)-V(%s)\n", ck.ID, Sindex, op, rpl.Err, key, value)
+			}
+			// time.Sleep(25 * time.Millisecond)
 		}
+	}
+	if i != Sindex {
+		atomic.StoreInt64(&ck.usefulServerIndex, Sindex)
+		ck.Logger.Printf("'Client(%d)s usefulServerIndex Been Rewritten to [%d]'\n", ck.ID, Sindex)
 	}
 }
 
