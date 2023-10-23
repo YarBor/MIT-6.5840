@@ -43,7 +43,7 @@ func (r *Raft) checkFuncDone(FuncName string) func() {
 		i2 <- true
 		for {
 			select {
-			case <-time.After(rpcTimeOut * 2 * time.Millisecond):
+			case <-time.After(HeartbeatTimeout * 2 * time.Millisecond):
 				r.Dolog(-1, "\n", t, "!!!!\t", FuncName+" MayLocked\n")
 			case <-i:
 				close(i)
@@ -65,8 +65,7 @@ const (
 	LevelFollower  = int32(1)
 
 	commitChanSize   = int32(100)
-	rpcTimeOut       = 200 * time.Millisecond
-	HeartbeatTimeout = 75 * time.Millisecond
+	HeartbeatTimeout = 40 * time.Millisecond
 	voteTimeOut      = 200
 
 	LogCheckBeginOrReset = 0
@@ -180,6 +179,27 @@ type RaftPeer struct {
 	logIndexTermLock sync.Mutex
 	logIndex         int32
 	lastLogTerm      int32
+	lastTalkTime     int64
+}
+
+func (R *RaftPeer) updateLastTalkTime() {
+	atomic.StoreInt64(&R.lastTalkTime, time.Now().UnixMicro())
+}
+func (R *RaftPeer) isTimeOut() bool {
+	return time.Now().UnixMicro()-atomic.LoadInt64(&R.lastTalkTime) > HeartbeatTimeout.Microseconds()
+}
+func (rf *Raft) checkOutLeaderOnline() bool {
+	Len := len(rf.raftPeers)
+	count := 1
+	for i := range rf.raftPeers {
+		if i != rf.me && !rf.raftPeers[i].isTimeOut() {
+			count++
+			if count > Len/2 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tmp stuct to update Log data
@@ -338,7 +358,6 @@ func (r *Raft) registeHeartBeat(index int) {
 		case <-r.raftPeers[index].BeginHeartBeat:
 		}
 		for {
-			rpl := RequestReply{}
 			select {
 			case <-r.KilledChan:
 				return
@@ -352,6 +371,7 @@ func (r *Raft) registeHeartBeat(index int) {
 			if r.getLevel() != LevelLeader {
 				goto restart
 			}
+			rpl := RequestReply{}
 			arg.LastLogIndex, arg.LastLogTerm = r.getLastLogData()
 			arg.SelfTerm = r.getTerm()
 			arg.Time = time.Now()
@@ -527,7 +547,7 @@ func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
 
 	buffer := bytes.Buffer{}
 	encoder := labgob.NewEncoder(&buffer)
-	err := encoder.Encode(rf.getSnapshotUnsafe().CommandIndex)
+	err := encoder.Encode(rf.getSnapshotUnsafe().SnapshotIndex)
 	if err != nil {
 		log.Fatal("Failed to encode CommitIndex: ", err)
 	}
@@ -544,8 +564,8 @@ func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
 	rf.commandLog.Msgs[0].Snapshot = i
 	encodedData := buffer.Bytes() // 获取编码后的数据
 
-	if snapshot != nil && snapshot.Snapshot != nil {
-		rf.persister.Save(encodedData, snapshot.Snapshot) // 保存数据到持久化存储
+	if rf.commandLog.Msgs[0] != nil && rf.commandLog.Msgs[0].Snapshot != nil {
+		rf.persister.Save(encodedData, rf.commandLog.Msgs[0].Snapshot) // 保存数据到持久化存储
 	} else {
 		rf.persister.Save(encodedData, nil) // 保存数据到持久化存储
 	}
@@ -1138,10 +1158,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.commandLog.MsgRwMu.Lock()
 	defer rf.commandLog.MsgRwMu.Unlock()
 
-	if LevelNow != LevelLeader || command == nil {
-		i, m, l := int(rf.getLogIndexUnsafe()), int(TermNow), LevelNow == LevelLeader
-		rf.Dolog(-1, "Start return ", "LogIndex", i, "Term", m, "Level", l)
-		return i, m, l
+	if i, m := int(rf.getLogIndexUnsafe()), int(TermNow); LevelNow != LevelLeader || !rf.checkOutLeaderOnline() {
+		rf.Dolog(-1, "Start return ", "LogIndex", i, "Term", m, "Level", LevelNow)
+		return i, m, false
+	} else if command == nil {
+		return i, m, true
 	}
 
 	var arg *RequestArgs
@@ -1316,6 +1337,9 @@ func (r *Raft) leaderUpdatePeer(peerIndex int, msg *LogData) {
 
 		// 没有超时机制
 		ok := r.raftPeers[peerIndex].C.Call("Raft.HeartBeat", &arg, &rpl)
+		if ok {
+			r.raftPeers[peerIndex].updateLastTalkTime()
+		}
 
 		r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) return ", rpl.string())
 
@@ -1495,8 +1519,7 @@ func TryToBecomeLeader(rf *Raft) {
 
 func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestReply) bool {
 	asdf := time.Now().UnixNano()
-
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeOut)
+	ctx, cancel := context.WithTimeout(context.Background(), HeartbeatTimeout)
 	defer cancel()
 	i := false
 	go func() {
@@ -1511,7 +1534,8 @@ func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestRe
 	}()
 	select {
 	case <-ctx.Done():
-	case <-time.After(rpcTimeOut):
+		r.raftPeers[index].updateLastTalkTime()
+	case <-time.After(HeartbeatTimeout):
 		r.Dolog(index, "Rpc Timeout ", FuncName, arg.string(), rpl.string())
 	}
 	return i
