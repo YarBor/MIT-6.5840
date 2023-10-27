@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -15,7 +16,7 @@ import (
 )
 
 func (kv *KVServer) checkFuncDone(FuncName ...interface{}) func() {
-	t := time.Now().UnixNano()
+	t := time.Now().UnixMilli()
 	i := make(chan bool, 1)
 	i2 := make(chan bool, 1)
 	go func() {
@@ -33,8 +34,9 @@ func (kv *KVServer) checkFuncDone(FuncName ...interface{}) func() {
 	<-i2
 	close(i2)
 	return func() {
+		t2 := time.Now().UnixMilli()
 		i <- true
-		kv.Dolog("\t", t, FuncName, " return")
+		kv.Dolog("\t", t, FuncName, " return", t2-t, "ms")
 	}
 }
 func (kv *KVServer) Dolog(i ...interface{}) {
@@ -78,6 +80,8 @@ type KVServer struct {
 
 	DebugLoger *log.Logger
 	CheckCache *cache
+
+	snapshotIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -218,7 +222,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	}
 	kv.DebugLoger = log.New(file2, "", log.LstdFlags)
 	kv.DebugLoger.SetFlags(log.Lmicroseconds)
+	kv.Dolog("\n\n\n\n\nKvServer started")
 	kv.CheckCache = makeCache()
+	kv.snapshotDecode(kv.rf.GetSnapshot())
 	go kv.loadData()
 	return kv
 }
@@ -239,46 +245,107 @@ func (kv *KVServer) loadData() {
 			break
 		}
 		checkdone := kv.checkFuncDone("LoadData")
-		Command, ok := submitCommand.Command.(PutAppendArgs)
-		if !ok {
-			kv.Dolog(submitCommand, "Command Not PutAppendArgs{}")
-			fmt.Printf("reflect.TypeOf(submitCommand.Command): %v\n", reflect.TypeOf(submitCommand.Command))
-			panic("GetCommandFalse")
-		} else {
-			if commandMode := kv.check(Command.SelfID, Command.ArgsId); commandMode == commandIsDone {
-				kv.Dolog("get command ", Command, " Has Done Before")
-				continue
+		if submitCommand.CommandValid {
+			Command, ok := submitCommand.Command.(PutAppendArgs)
+			if !ok {
+				kv.Dolog(submitCommand, "Command Not PutAppendArgs{}")
+				fmt.Printf("reflect.TypeOf(submitCommand.Command): %v\n", reflect.TypeOf(submitCommand.Command))
+				panic("GetCommandFalse")
 			} else {
-				kv.DataRWLock.Lock()
-				kv.Dolog("to do command ", Command)
-				switch Command.Op {
-				case "Put":
-					kv.Data[Command.Key] = Command.Value
-				case "Append":
-					if value, ok := kv.Data[Command.Key]; ok {
-						kv.Data[Command.Key] = value + Command.Value
-					} else {
+				if commandMode := kv.check(Command.SelfID, Command.ArgsId); commandMode == commandIsDone {
+					kv.Dolog("get command ", Command, " Has Done Before")
+					checkdone()
+					continue
+				} else {
+					kv.DataRWLock.Lock()
+					kv.Dolog("to do command ", Command)
+					switch Command.Op {
+					case "Put":
 						kv.Data[Command.Key] = Command.Value
+					case "Append":
+						if value, ok := kv.Data[Command.Key]; ok {
+							kv.Data[Command.Key] = value + Command.Value
+						} else {
+							kv.Data[Command.Key] = Command.Value
+						}
 					}
+					kv.DataRWLock.Unlock()
+					kv.registe(&Command)
+					kv.Dolog("Done command ", Command)
 				}
-				kv.DataRWLock.Unlock()
-				kv.registe(&Command)
-				kv.Dolog("Done command ", Command)
 			}
-		}
-		kv.RequestMapLock.Lock()
-		n := node{ArgsId: Command.ArgsId, SelfID: Command.SelfID}
-		IsloadChan, ok := kv.RequestMap[n]
-		if !ok {
-		} else {
-			delete(kv.RequestMap, n)
-			IsloadChan <- true
-			close(IsloadChan)
-		}
-		kv.RequestMapLock.Unlock()
-		checkdone()
+			kv.RequestMapLock.Lock()
+			n := node{ArgsId: Command.ArgsId, SelfID: Command.SelfID}
+			IsloadChan, ok := kv.RequestMap[n]
+			if !ok {
+			} else {
+				delete(kv.RequestMap, n)
+				IsloadChan <- true
+				close(IsloadChan)
+			}
+			kv.RequestMapLock.Unlock()
+			checkdone()
+			if size := int(kv.rf.RaftSize()); kv.maxraftstate != -1 && size >= kv.maxraftstate/2 {
+				kv.Dolog("do SnapShot", submitCommand, "size:", size)
+				buffer := bytes.Buffer{}
+				encoder := labgob.NewEncoder(&buffer)
+				encoder.Encode(submitCommand.CommandIndex)
+				kv.snapshotIndex = submitCommand.CommandIndex
 
+				kv.DataRWLock.RLock()
+				encoder.Encode(kv.Data)
+				kv.DataRWLock.RUnlock()
+
+				kv.CheckCache.rwlock.Lock()
+				encoder.Encode(kv.CheckCache.data)
+				kv.CheckCache.rwlock.Unlock()
+
+				data := buffer.Bytes()
+
+				kv.rf.Snapshot(submitCommand.CommandIndex, data)
+			}
+		} else if submitCommand.SnapshotValid {
+			kv.snapshotDecode(&submitCommand)
+			checkdone()
+		} else {
+			panic("wrong command")
+		}
 	}
+}
+func (kv *KVServer) snapshotDecode(submitCommand *raft.ApplyMsg) {
+	if !submitCommand.SnapshotValid || submitCommand.Snapshot == nil {
+		return
+	}
+	kv.Dolog("Save SnapShot", *submitCommand)
+	buffer := bytes.NewBuffer(submitCommand.Snapshot)
+	decoder := labgob.NewDecoder(buffer)
+	Index := -1
+	if err := decoder.Decode(&Index); err != nil {
+		panic(err)
+	} else {
+		if Index <= kv.snapshotIndex {
+			return
+		}
+		kv.snapshotIndex = Index
+	}
+	// data
+	var newdata map[string]string
+	if err := decoder.Decode(&newdata); err != nil {
+		panic(err)
+	}
+
+	kv.DataRWLock.Lock()
+	kv.Data = newdata
+	kv.DataRWLock.Unlock()
+	kv.Dolog(newdata)
+	// check data
+	var newCheckMap map[int64]*struct{ CommandId int64 }
+	if err := decoder.Decode(&newCheckMap); err != nil {
+		panic(err)
+	}
+	kv.CheckCache.rwlock.Lock()
+	kv.CheckCache.data = newCheckMap
+	kv.CheckCache.rwlock.Unlock()
 }
 
 /*
@@ -339,12 +406,12 @@ Server 再一次 拿到 该命令
 var LogDDL = 20 * time.Second
 
 type cache struct {
-	data   map[int64]*struct{ commandId int64 }
+	data   map[int64]*struct{ CommandId int64 }
 	rwlock sync.RWMutex
 }
 
 func makeCache() *cache {
-	C := &cache{data: make(map[int64]*struct{ commandId int64 })}
+	C := &cache{data: make(map[int64]*struct{ CommandId int64 })}
 	return C
 }
 
@@ -358,7 +425,7 @@ func (kv *KVServer) check(SelfId int64, ArgsId int64) int {
 	i, ok := kv.CheckCache.data[SelfId]
 	kv.CheckCache.rwlock.RUnlock()
 	if ok {
-		Id := atomic.LoadInt64(&i.commandId)
+		Id := atomic.LoadInt64(&i.CommandId)
 		kv.Dolog("[", SelfId, "] check ", ArgsId, " history", Id)
 		if Id >= ArgsId {
 			return commandIsDone
@@ -375,12 +442,12 @@ func (kv *KVServer) registe(input *PutAppendArgs) {
 	kv.CheckCache.rwlock.RUnlock()
 	if !ok {
 		kv.CheckCache.rwlock.Lock()
-		kv.CheckCache.data[input.SelfID] = &struct{ commandId int64 }{commandId: input.ArgsId}
+		kv.CheckCache.data[input.SelfID] = &struct{ CommandId int64 }{CommandId: input.ArgsId}
 		kv.CheckCache.rwlock.Unlock()
 		kv.Dolog("registe ", input.SelfID, "--", input.ArgsId)
 		return
 	} else {
-		// atomic.CompareAndSwapInt64(&i.commandId,atomic.LoadInt64(&i.commandId),input.ArgsId)
-		atomic.StoreInt64(&i.commandId, input.ArgsId)
+		// atomic.CompareAndSwapInt64(&i.CommandId,atomic.LoadInt64(&i.CommandId),input.ArgsId)
+		atomic.StoreInt64(&i.CommandId, input.ArgsId)
 	}
 }

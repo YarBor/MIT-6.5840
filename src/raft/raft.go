@@ -252,6 +252,8 @@ type Raft struct {
 	DebugLoger *log.Logger
 
 	applyChan chan ApplyMsg
+
+	logSize int64 //
 }
 
 func (r *Raft) getCommitIndex() int32 {
@@ -283,7 +285,7 @@ func (r *Raft) setCommitIndexUnsafe(i int32) {
 	r.commitIndex = i
 	// r.registPersist()
 }
-func (r *Raft) getSnapshot() *ApplyMsg {
+func (r *Raft) GetSnapshot() *ApplyMsg {
 	r.commandLog.MsgRwMu.RLock()
 	defer r.commandLog.MsgRwMu.RUnlock()
 	return r.getSnapshotUnsafe()
@@ -598,6 +600,7 @@ func (rf *Raft) persistUnsafe(snapshot *ApplyMsg) {
 		*rf.commandLog.Msgs[0])
 
 	rf.DebugLoger.Println("\nPersist Save - " + output)
+	atomic.StoreInt64(&rf.logSize, int64(rf.persister.RaftStateSize()))
 }
 
 // Unsafe
@@ -607,6 +610,9 @@ func showMsgS(rf []*ApplyMsg) string {
 		str += rf[i].string() + "\n"
 	}
 	return str
+}
+func (rf *Raft) RaftSize() int64 {
+	return atomic.LoadInt64(&rf.logSize)
 }
 
 // restore previously persisted state.
@@ -758,8 +764,9 @@ func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
 	reply.PeerLastLogIndex, reply.PeerLastLogTerm = r.getLastLogData()
 	reply.PeerSelfTerm = r.getTerm()
 	reply.ReturnTime = time.Now()
+	selfCommitINdex := r.getCommitIndex()
 	// reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && ((reply.PeerLastLogTerm < args.LastLogTerm) || (reply.PeerLastLogIndex <= args.LastLogIndex && reply.PeerLastLogTerm == args.LastLogTerm))
-	reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && args.LastLogTerm >= reply.PeerLastLogTerm && (args.LastLogTerm > reply.PeerLastLogTerm || args.LastLogIndex >= reply.PeerLastLogIndex) && reply.PeerSelfTerm < args.SelfTerm
+	reply.IsAgree = args.CommitIndex >= selfCommitINdex && (atomic.LoadInt32(&r.isLeaderAlive) == 0 && args.LastLogTerm >= reply.PeerLastLogTerm && (args.LastLogTerm > reply.PeerLastLogTerm || args.LastLogIndex >= reply.PeerLastLogIndex) && reply.PeerSelfTerm < args.SelfTerm)
 }
 
 func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
@@ -773,19 +780,26 @@ func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
 	defer rf.termLock.Unlock()
 	reply.PeerSelfTerm = rf.term
 	reply.PeerLastLogIndex, reply.PeerLastLogTerm = rf.getLastLogData()
-	//	选举投票与否的标准是 各个节点的日志的新旧程度 当新旧程度一样时 再比较投票的任期
+	//	选举投票与否的标准是 各个节点的commit程度 各个节点的日志的新旧程度 当新旧程度一样时 再比较投票的任期
 	reply.IsAgree = true
-	if args.LastLogTerm < reply.PeerLastLogTerm {
+	selfCommitINdex := rf.getCommitIndex()
+	if args.CommitIndex > selfCommitINdex {
+		reply.IsAgree = true
+	} else if args.CommitIndex < selfCommitINdex {
 		reply.IsAgree = false
-		rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogTerm < reply.PeerLastLogTerm")
-	} else if args.LastLogTerm == reply.PeerLastLogTerm {
-		if args.LastLogIndex < reply.PeerLastLogIndex {
+	} else {
+		if args.LastLogTerm < reply.PeerLastLogTerm {
 			reply.IsAgree = false
-			rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogIndex < reply.PeerLastLogIndex")
-		} else if args.LastLogIndex == reply.PeerLastLogIndex {
-			if args.SelfTerm <= reply.PeerSelfTerm {
+			rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogTerm < reply.PeerLastLogTerm")
+		} else if args.LastLogTerm == reply.PeerLastLogTerm {
+			if args.LastLogIndex < reply.PeerLastLogIndex {
 				reply.IsAgree = false
-				rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.SelfTerm <= reply.PeerSelfTerm")
+				rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.LastLogIndex < reply.PeerLastLogIndex")
+			} else if args.LastLogIndex == reply.PeerLastLogIndex {
+				if args.SelfTerm <= reply.PeerSelfTerm {
+					reply.IsAgree = false
+					rf.Dolog(int(args.SelfIndex), "Disagree Vote Because of "+"args.SelfTerm <= reply.PeerSelfTerm")
+				}
 			}
 		}
 	}
@@ -1301,7 +1315,9 @@ func (r *Raft) getLogs(index int, Len int) []*LogData {
 	result := make([]*LogData, 0)
 	if targetLogIndexBegin <= 0 {
 		if r.commandLog.Msgs[0].SnapshotValid {
-			result = append(result, &LogData{Msg: r.commandLog.Msgs[0], SelfIndex: r.me, SelfTermNow: int(termNow)})
+			result = append(result, &LogData{SelfIndex: r.me, SelfTermNow: int(termNow)})
+			i := *r.commandLog.Msgs[0]
+			result[0].Msg = &i
 		}
 		targetLogIndexBegin = 1
 	}
@@ -1463,7 +1479,7 @@ func (rf *Raft) ticker() {
 func TryToBecomeLeader(rf *Raft) {
 	defer rf.checkFuncDone("TryToBecomeLeader")()
 	rf.changeToCandidate()
-	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me)}
+	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me),CommitIndex: rf.getCommitIndex()}
 
 	// 这里要拿日志锁
 	arg.LastLogIndex, arg.LastLogTerm = rf.getLastLogData()
@@ -1624,9 +1640,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
-	rf.commandLog.MsgRwMu.Lock()
+	rf.commandLog.MsgRwMu.RLock()
 	go func() {
-		defer rf.commandLog.MsgRwMu.Unlock()
+		defer rf.commandLog.MsgRwMu.RUnlock()
 		if rf.commandLog.Msgs[0].SnapshotValid {
 			rf.applyChan <- *rf.commandLog.Msgs[0]
 		}
@@ -1706,7 +1722,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 					// atomic.StoreInt32(&rf.commitIndex, ToLogIndex)
 					rf.Dolog(-1, "Committer: Update CommitIndex", ToLogIndex)
 					rf.justSetCommitIndex(ToLogIndex)
-					rf.persist(rf.getSnapshot())
+					rf.persist(rf.GetSnapshot())
 					rf.sendHeartBeat()
 				}
 			}
@@ -1772,7 +1788,6 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 					}()
 				if rf.getLevel() != LevelLeader {
 					rf.setCommitIndex(LogedIndex)
-					rf.persist(rf.getSnapshot())
 				}
 				if !findLogSuccess || LogedIndex == ToLogIndex {
 					break
@@ -1781,8 +1796,8 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 			if !findLogSuccess {
 				//log
 				rf.Dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
-				continue
 			}
+			rf.persist(rf.GetSnapshot())
 		}
 	}
 }
