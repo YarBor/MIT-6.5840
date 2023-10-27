@@ -14,17 +14,17 @@ import (
 	"6.5840/raft"
 )
 
-func (kv *KVServer) checkFuncDone(FuncName string) func() {
+func (kv *KVServer) checkFuncDone(FuncName ...interface{}) func() {
 	t := time.Now().UnixNano()
 	i := make(chan bool, 1)
 	i2 := make(chan bool, 1)
 	go func() {
-		kv.Dolog("\t", t, FuncName+" GO")
+		kv.Dolog("\t", t, FuncName, " GO")
 		i2 <- true
 		for {
 			select {
 			case <-time.After(1 * time.Second):
-				kv.Dolog("\t", t, "!!!!\t", FuncName+" MayLocked")
+				kv.Dolog("\t", t, "!!!!\t", FuncName, " MayLocked")
 			case <-i:
 				return
 			}
@@ -34,7 +34,7 @@ func (kv *KVServer) checkFuncDone(FuncName string) func() {
 	close(i2)
 	return func() {
 		i <- true
-		kv.Dolog("\t", t, FuncName+" return")
+		kv.Dolog("\t", t, FuncName, " return")
 	}
 }
 func (kv *KVServer) Dolog(i ...interface{}) {
@@ -82,53 +82,62 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	defer kv.checkFuncDone("Get")()
 	if kv.killed() {
 		reply.Err = "Server killed"
 		return
 	}
-	if _, _, ok := kv.rf.Start(nil); !ok {
-		reply.Err = "Not Leader"
-	} else {
-		kv.DataRWLock.RLock()
-		V, ok := kv.Data[args.Key]
-		kv.DataRWLock.RUnlock()
-		if ok {
-			reply.Value = V
-		} else {
+	if _, _, ok := kv.rf.Start(nil); ok && kv.rf.Ping() {
+		defer kv.checkFuncDone("Get")()
+		defer func(args *GetArgs, reply *GetReply) { kv.Dolog(*args, *reply) }(args, reply)
+		commandMode := 0
+		if commandMode = kv.check(args.SelfID, args.ArgsId); commandMode == commandNoDone {
+			kv.Dolog("[Get] check return commandNoDone")
+			reply.Err = ErrNeedWait
+			return
+		} else if commandMode == noRegiste && args.ArgsId != 0 {
+			kv.Dolog("[Get] check return noRegiste")
+			reply.Err = ErrNeedWait
+			return
 		}
+		kv.DataRWLock.RLock()
+		V, exist := kv.Data[args.Key]
+		kv.DataRWLock.RUnlock()
+		if exist {
+			reply.Value = V
+			kv.Dolog(*reply)
+		}
+	} else {
+		reply.Err = ErrWrongLeader
 	}
-	kv.Dolog(*reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-
-	defer kv.checkFuncDone("PutAppend")()
 	// Your code here.
 	if kv.killed() {
 		reply.Err = "Server killed"
 		return
 	}
-	if _, _, ok := kv.rf.Start(nil); !ok {
-		kv.Dolog("Get PutAppend Request", *args, "No Leader")
-		reply.Err = "This server is not leader"
-		return
-	}
-	var IsLoadChan chan bool
-	if Isdone := kv.CheckCache.check(args); Isdone {
+
+	if commandMode := kv.check(args.SelfID, args.ArgsId); commandMode == commandIsDone {
 		kv.Dolog("get req PutAppend", *args, "But already loaded return ")
 		return
 	}
+
+	var IsLoadChan chan bool
 	n := node{ArgsId: args.ArgsId, SelfID: args.SelfID}
-	if _, _, ok := kv.rf.Start(*args); ok {
+
+	if _, _, ok := kv.rf.Start(*args); ok || kv.rf.Ping() {
+		defer kv.checkFuncDone("PutAppend  ")()
+		defer func(args *PutAppendArgs, reply *PutAppendReply) { kv.Dolog(*args, *reply) }(args, reply)
+
 		IsLoadChan = make(chan bool, 1)
 		kv.RequestMapLock.Lock()
-
 		kv.RequestMap[n] = IsLoadChan
 		kv.RequestMapLock.Unlock()
+
 	} else {
 		kv.Dolog("Get PutAppend Request", *args, "No Leader")
-		reply.Err = "This server is not leader"
+		reply.Err = ErrWrongLeader
 		return
 	}
 	select {
@@ -138,7 +147,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if ok {
 			delete(kv.RequestMap, n)
 			close(IsLoadChan)
-			reply.Err = "Timeout"
+			reply.Err = ErrTimeout
 			kv.Dolog("Timeout", *args)
 		}
 		kv.RequestMapLock.Unlock()
@@ -215,11 +224,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) loadData() {
+	var submitCommand raft.ApplyMsg
+	var ok bool
 	for {
 		if kv.killed() {
 			return
 		}
-		submitCommand, ok := <-kv.applyCh
+		select {
+		case <-time.After(10 * time.Millisecond):
+			continue
+		case submitCommand, ok = <-kv.applyCh:
+		}
 		if !ok {
 			break
 		}
@@ -230,7 +245,7 @@ func (kv *KVServer) loadData() {
 			fmt.Printf("reflect.TypeOf(submitCommand.Command): %v\n", reflect.TypeOf(submitCommand.Command))
 			panic("GetCommandFalse")
 		} else {
-			if IsDone := kv.CheckCache.check(&Command); IsDone {
+			if commandMode := kv.check(Command.SelfID, Command.ArgsId); commandMode == commandIsDone {
 				kv.Dolog("get command ", Command, " Has Done Before")
 				continue
 			} else {
@@ -247,7 +262,7 @@ func (kv *KVServer) loadData() {
 					}
 				}
 				kv.DataRWLock.Unlock()
-				kv.CheckCache.registe(&Command)
+				kv.registe(&Command)
 				kv.Dolog("Done command ", Command)
 			}
 		}
@@ -333,24 +348,36 @@ func makeCache() *cache {
 	return C
 }
 
-// 是否重复id
-func (c *cache) check(input *PutAppendArgs) bool {
-	c.rwlock.RLock()
-	i, ok := c.data[input.SelfID]
-	c.rwlock.RUnlock()
+// IsDone
+var commandIsDone = 1
+var commandNoDone = 2
+var noRegiste = 3
+
+func (kv *KVServer) check(SelfId int64, ArgsId int64) int {
+	kv.CheckCache.rwlock.RLock()
+	i, ok := kv.CheckCache.data[SelfId]
+	kv.CheckCache.rwlock.RUnlock()
 	if ok {
-		return atomic.LoadInt64(&i.commandId) >= input.ArgsId
+		Id := atomic.LoadInt64(&i.commandId)
+		kv.Dolog("[", SelfId, "] check ", ArgsId, " history", Id)
+		if Id >= ArgsId {
+			return commandIsDone
+		} else {
+			return commandNoDone
+		}
 	}
-	return false
+	kv.Dolog("check ", ArgsId, " history", nil)
+	return noRegiste
 }
-func (c *cache) registe(input *PutAppendArgs) {
-	c.rwlock.RLock()
-	i, ok := c.data[input.SelfID]
-	c.rwlock.RUnlock()
+func (kv *KVServer) registe(input *PutAppendArgs) {
+	kv.CheckCache.rwlock.RLock()
+	i, ok := kv.CheckCache.data[input.SelfID]
+	kv.CheckCache.rwlock.RUnlock()
 	if !ok {
-		c.rwlock.Lock()
-		c.data[input.SelfID] = &struct{ commandId int64 }{commandId: input.ArgsId}
-		c.rwlock.Unlock()
+		kv.CheckCache.rwlock.Lock()
+		kv.CheckCache.data[input.SelfID] = &struct{ commandId int64 }{commandId: input.ArgsId}
+		kv.CheckCache.rwlock.Unlock()
+		kv.Dolog("registe ", input.SelfID, "--", input.ArgsId)
 		return
 	} else {
 		// atomic.CompareAndSwapInt64(&i.commandId,atomic.LoadInt64(&i.commandId),input.ArgsId)

@@ -13,6 +13,8 @@ import (
 	"6.5840/labrpc"
 )
 
+var ID = int64(0)
+
 func (c *Clerk) checkFuncDone(FuncName string) func() {
 	t := time.Now().UnixNano()
 	i := make(chan bool, 1)
@@ -59,7 +61,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = append(make([]*labrpc.ClientEnd, 0), servers...)
 	// You'll have to add code here.
-	ck.ID = nrand()
+	ck.ID = atomic.AddInt64(&ID, 1)
+	ck.CommandId = 0
 	file2, err := os.OpenFile(fmt.Sprintf("/home/wang/raftLog/Client_%d.R", os.Getpid()), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("err.Error(): %v\n", err.Error()))
@@ -82,7 +85,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	defer ck.checkFuncDone("Get")()
-	args := GetArgs{Key: key}
+	args := GetArgs{Key: key, ArgsId: atomic.LoadInt64(&ck.CommandId), SelfID: ck.ID}
 	Sindex := atomic.LoadInt64(&ck.usefulServerIndex)
 	i := Sindex
 	var rpl *GetReply
@@ -92,6 +95,11 @@ func (ck *Clerk) Get(key string) string {
 		if ok := ck.servers[Sindex].Call("KVServer.Get", &args, rpl); ok && rpl.Err == "" {
 			break
 		} else {
+			if rpl.Err == ErrWrongLeader {
+			} else if rpl.Err == ErrNeedWait {
+				time.Sleep(25 * time.Millisecond)
+				Sindex = Sindex + int64(len(ck.servers)-1) // for continue
+			}
 			ck.Logger.Printf("Client(%d)--S[%d] Call false %+v", ck.ID, Sindex, *rpl)
 			// time.Sleep(25 * time.Millisecond)
 		}
@@ -128,15 +136,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		rpl := PutAppendReply{}
 		ck.Logger.Printf("Client(%d)--Server(%d) Call %s K[%s]", ck.ID, Sindex, op, key)
 		if ok := ck.servers[Sindex].Call("KVServer.PutAppend", &args, &rpl); ok && len(rpl.Err) == 0 {
-			ck.Logger.Printf("Client(%d)--Server[%d] %s K(%s)-V(%s)\n", ck.ID, Sindex, op, key, value)
+			ck.Logger.Printf("Client(%d)--Server[%d] %s-ed K(%s)-V(%s)\n", ck.ID, Sindex, op, key, value)
 			break
 		} else {
 			if !ok {
 				ck.Logger.Printf("Client(%d)--Server(%d) Call %s Call False ", ck.ID, Sindex, op)
-			} else if len(rpl.Err) > 0 {
+			} else if rpl.Err == ErrWrongLeader{
+			} else if rpl.Err == ErrNeedWait {
+				ck.Logger.Printf("Client(%d)--Server[%d] %s[Err:%s] K(%s)-V(%s)\n", ck.ID, Sindex, op, rpl.Err, key, value)
+				time.Sleep(25 * time.Millisecond)
+				Sindex = Sindex + int64(len(ck.servers)-1) // for continue
+				continue
+			} else if rpl.Err == ErrTimeout {
 				ck.Logger.Printf("Client(%d)--Server[%d] %s[Err:%s] K(%s)-V(%s)\n", ck.ID, Sindex, op, rpl.Err, key, value)
 			}
-			// time.Sleep(25 * time.Millisecond)
+			time.Sleep(25 * time.Millisecond)
 		}
 	}
 	if i != Sindex {
