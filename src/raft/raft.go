@@ -59,14 +59,14 @@ func (r *Raft) checkFuncDone(FuncName string) func() {
 	}
 }
 
-const (
+var (
 	LevelLeader    = int32(3)
 	LevelCandidate = int32(2)
 	LevelFollower  = int32(1)
 
 	commitChanSize   = int32(100)
-	HeartbeatTimeout = 14 * time.Millisecond
-	voteTimeOut      = 200
+	HeartbeatTimeout = 40 * time.Millisecond
+	voteTimeOut      = 100
 
 	LogCheckBeginOrReset = 0
 	LogCheckAppend       = 1
@@ -187,7 +187,7 @@ func (R *RaftPeer) updateLastTalkTime() {
 	atomic.StoreInt64(&R.lastTalkTime, time.Now().UnixMicro())
 }
 func (R *RaftPeer) isTimeOut() bool {
-	return time.Now().UnixMicro()-atomic.LoadInt64(&R.lastTalkTime) > (HeartbeatTimeout + time.Millisecond).Microseconds()
+	return time.Now().UnixMicro()-atomic.LoadInt64(&R.lastTalkTime) > (HeartbeatTimeout*3/2).Microseconds()
 }
 func (rf *Raft) checkOutLeaderOnline() bool {
 	Len := len(rf.raftPeers)
@@ -1603,7 +1603,7 @@ func (r *Raft) call(index int, FuncName string, arg *RequestArgs, rpl *RequestRe
 }
 
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
-	os.Stderr.WriteString("Raft Make \n")
+	// os.Stderr.WriteString("Raft Make \n")
 	rf := &Raft{}
 	rf.pMsgStore = &MsgStore{msgs: make([]*LogData, 0), owner: -1, term: -1, mu: sync.Mutex{}}
 	rf.commitChan = make(chan int32, commitChanSize)
