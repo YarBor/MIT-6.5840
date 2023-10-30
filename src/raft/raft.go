@@ -65,7 +65,7 @@ const (
 	LevelFollower  = int32(1)
 
 	commitChanSize   = int32(100)
-	HeartbeatTimeout = 40 * time.Millisecond
+	HeartbeatTimeout = 14 * time.Millisecond
 	voteTimeOut      = 200
 
 	LogCheckBeginOrReset = 0
@@ -125,7 +125,7 @@ type RequestReply struct {
 	PeerLastLogTerm  int32
 	ReturnTime       time.Time
 	IsAgree          bool
-
+	PeerCommitIndex  int32
 	// If there is this field,
 	// it means that this reply will use to
 	// request more LogData.
@@ -180,6 +180,7 @@ type RaftPeer struct {
 	logIndex         int32
 	lastLogTerm      int32
 	lastTalkTime     int64
+	commitIndex      int32
 }
 
 func (R *RaftPeer) updateLastTalkTime() {
@@ -407,6 +408,7 @@ func (r *Raft) goSendHeartBeat(index int) bool {
 			} else if rpl.PeerLastLogTerm == r.raftPeers[index].lastLogTerm {
 				r.raftPeers[index].logIndex = rpl.PeerLastLogIndex
 			}
+			r.raftPeers[index].commitIndex = rpl.PeerCommitIndex
 		}()
 		if rpl.PeerLastLogIndex < arg.LastLogIndex || rpl.PeerLastLogTerm < arg.LastLogTerm {
 			r.tryleaderUpdatePeer(index, &LogData{Msg: nil, LastTimeIndex: int(arg.LastLogIndex), LastTimeTerm: int(arg.LastLogTerm)})
@@ -538,6 +540,7 @@ func (r *Raft) HeartBeat(arg *RequestArgs, rpl *RequestReply) {
 	} else if arg.CommitIndex > r.getCommitIndex() {
 		r.tryUpdateCommitIndex(arg.CommitIndex)
 	}
+	rpl.PeerCommitIndex = r.getCommitIndex()
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -765,6 +768,7 @@ func (r *Raft) RequestPreVote(args *RequestArgs, reply *RequestReply) {
 	reply.PeerSelfTerm = r.getTerm()
 	reply.ReturnTime = time.Now()
 	selfCommitINdex := r.getCommitIndex()
+	reply.PeerCommitIndex = selfCommitINdex
 	// reply.IsAgree = atomic.LoadInt32(&r.isLeaderAlive) == 0 && ((reply.PeerLastLogTerm < args.LastLogTerm) || (reply.PeerLastLogIndex <= args.LastLogIndex && reply.PeerLastLogTerm == args.LastLogTerm))
 	reply.IsAgree = args.CommitIndex >= selfCommitINdex && (atomic.LoadInt32(&r.isLeaderAlive) == 0 && args.LastLogTerm >= reply.PeerLastLogTerm && (args.LastLogTerm > reply.PeerLastLogTerm || args.LastLogIndex >= reply.PeerLastLogIndex) && reply.PeerSelfTerm < args.SelfTerm)
 }
@@ -815,6 +819,7 @@ func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
 		atomic.StoreInt32(&rf.isLeaderAlive, 1)
 	}
 	reply.ReturnTime = time.Now()
+	reply.PeerCommitIndex = selfCommitINdex
 	rf.Dolog(int(args.SelfIndex), "answer RequestVote", args.string(), reply.string())
 }
 
@@ -1287,6 +1292,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.raftPeers[index].logIndexTermLock.Lock()
 					rf.raftPeers[index].lastLogTerm = rpl.PeerLastLogTerm
 					rf.raftPeers[index].logIndex = rpl.PeerLastLogIndex
+					rf.raftPeers[index].commitIndex = rpl.PeerCommitIndex
 					rf.raftPeers[index].logIndexTermLock.Unlock()
 				}
 			}(i)
@@ -1389,6 +1395,11 @@ func (r *Raft) leaderUpdatePeer(peerIndex int, msg *LogData) {
 		ok := r.raftPeers[peerIndex].C.Call("Raft.HeartBeat", &arg, &rpl)
 		if ok {
 			r.raftPeers[peerIndex].updateLastTalkTime()
+			r.raftPeers[peerIndex].logIndexTermLock.Lock()
+			r.raftPeers[peerIndex].commitIndex = rpl.PeerCommitIndex
+			r.raftPeers[peerIndex].lastLogTerm = rpl.PeerLastLogTerm
+			r.raftPeers[peerIndex].logIndex = rpl.PeerLastLogIndex
+			r.raftPeers[peerIndex].logIndexTermLock.Unlock()
 		}
 
 		r.Dolog(peerIndex, "leaderUpdate: HeartBeat(Update) return ", rpl.string())
@@ -1479,7 +1490,7 @@ func (rf *Raft) ticker() {
 func TryToBecomeLeader(rf *Raft) {
 	defer rf.checkFuncDone("TryToBecomeLeader")()
 	rf.changeToCandidate()
-	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me),CommitIndex: rf.getCommitIndex()}
+	arg := RequestArgs{SelfTerm: rf.getTerm() + 1, Time: time.Now(), SelfIndex: int32(rf.me), CommitIndex: rf.getCommitIndex()}
 
 	// 这里要拿日志锁
 	arg.LastLogIndex, arg.LastLogTerm = rf.getLastLogData()
@@ -1659,8 +1670,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 type peersLogSlice []peersLog
 type peersLog struct {
-	term  int32
-	index int32
+	term        int32
+	index       int32
+	commitIndex int32
 }
 
 func (s peersLogSlice) Len() int {
@@ -1694,34 +1706,46 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 	var LogedIndex int32
 	var ok bool
 	// init If restart
-	peerLogedIndexs := make([]peersLog, len(rf.raftPeers))
 	LogedIndex = rf.getCommitIndex()
 	ToLogIndex = LogedIndex
 
 	for {
+		peerLogedIndexs := make([]peersLog, len(rf.raftPeers))
 		select {
 		// leader scan followers to deside New TologIndex
 		case <-rf.KilledChan:
 			return
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(5 * time.Millisecond):
 			if rf.getLevel() == LevelLeader {
+				halfLenPeersCommitted := 0
 				for i := range rf.raftPeers {
+					if i == rf.me {
+						continue
+					}
 					rf.raftPeers[i].logIndexTermLock.Lock()
 					peerLogedIndexs[i].index = rf.raftPeers[i].logIndex
 					peerLogedIndexs[i].term = rf.raftPeers[i].lastLogTerm
+					peerLogedIndexs[i].commitIndex = rf.raftPeers[i].commitIndex
 					rf.raftPeers[i].logIndexTermLock.Unlock()
 				}
 				sort.Sort(peersLogSlice(peerLogedIndexs))
-				ToLogHalfIndex := peerLogedIndexs[(len(peerLogedIndexs))/2]
+				{
+					asdf := make([]int, 0)
+					for i := range peerLogedIndexs {
+						asdf = append(asdf, int(peerLogedIndexs[i].commitIndex))
+					}
+					sort.Ints(asdf)
+					halfLenPeersCommitted = asdf[len(asdf)/2+1]
+				}
+				ToLogHalfIndex := peerLogedIndexs[(len(peerLogedIndexs))/2+1]
 				_, SelfNowLastLogTerm := rf.getLastLogData()
 				if SelfNowLastLogTerm > ToLogHalfIndex.term {
 					continue
 				}
 				if ToLogHalfIndex.index > ToLogIndex {
-					ToLogIndex = ToLogHalfIndex.index
-					// atomic.StoreInt32(&rf.commitIndex, ToLogIndex)
+					ToLogIndex = int32(halfLenPeersCommitted)
 					rf.Dolog(-1, "Committer: Update CommitIndex", ToLogIndex)
-					rf.justSetCommitIndex(ToLogIndex)
+					rf.justSetCommitIndex(ToLogHalfIndex.index)
 					rf.persist(rf.GetSnapshot())
 					rf.sendHeartBeat()
 				}
@@ -1790,6 +1814,7 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 					rf.setCommitIndex(LogedIndex)
 				}
 				if !findLogSuccess || LogedIndex == ToLogIndex {
+					rf.persist(rf.GetSnapshot())
 					break
 				}
 			}
@@ -1797,7 +1822,6 @@ func (rf *Raft) committer(applyCh chan ApplyMsg) {
 				//log
 				rf.Dolog(-1, fmt.Sprintf("Committer:  Trying to Log Message[%d] But failed(OutOfRange[%d])", exceptLogMsgIndex, expectedLogMsgCacheIndex))
 			}
-			rf.persist(rf.GetSnapshot())
 		}
 	}
 }
