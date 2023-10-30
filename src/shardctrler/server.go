@@ -11,15 +11,14 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 )
+
 func init() {
 	raft.HeartbeatTimeout = 20 * time.Millisecond
 }
+
 const Debug = false
 
-func DPrintf(
-	format string,
-	a ...interface{},
-) (n int, err error) {
+func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
 	}
@@ -121,10 +120,7 @@ func (sc *ShardCtrler) applyRoutine() {
 	}
 }
 
-func (sc *ShardCtrler) Operation(
-	request *OperationRequest,
-	response *OperationResponse,
-) {
+func (sc *ShardCtrler) Operation(request *OperationRequest, response *OperationResponse) {
 	clientId := request.ClientId
 	messageId := request.MessageId
 	queryNum := request.QueryNum
@@ -170,12 +166,10 @@ func (sc *ShardCtrler) Operation(
 	}()
 }
 
-//
 // the tester calls Kill() when a ShardCtrler instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (sc *ShardCtrler) Kill() {
 	atomic.StoreInt32(&sc.dead, 1)
 	sc.rf.Kill()
@@ -191,17 +185,11 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 	return sc.rf
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant shardctrler service.
 // me is the index of the current server in servers[].
-//
-func StartServer(
-	servers []*labrpc.ClientEnd,
-	me int,
-	persister *raft.Persister,
-) *ShardCtrler {
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
 	sc := new(ShardCtrler)
 	sc.me = me
 	sc.persister = persister
